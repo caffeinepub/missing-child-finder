@@ -77,7 +77,12 @@ export function useGetAlerts() {
     queryKey: ["alerts"],
     queryFn: async () => {
       if (!actor) return [];
-      return actor.getAlerts();
+      try {
+        return await actor.getAlerts();
+      } catch {
+        // Non-admin users will get an unauthorized error — return empty array
+        return [];
+      }
     },
     enabled: !!actor && !isFetching,
   });
@@ -88,7 +93,8 @@ export function useRegisterCase() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: async (record: ChildRecord) => {
-      if (!actor) throw new Error("Not authenticated");
+      if (!actor)
+        throw new Error("Backend not connected. Please wait and try again.");
 
       let lastError: unknown;
       for (let attempt = 0; attempt < 3; attempt++) {
