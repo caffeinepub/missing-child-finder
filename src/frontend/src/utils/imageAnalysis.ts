@@ -1,11 +1,19 @@
 const CANVAS_SIZE = 64;
 const BINS = 32;
-const MODEL_URL = "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model";
-const FACEAPI_CDN =
-  "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js";
+
+const MODEL_URLS = [
+  "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model",
+  "https://cdn.jsdelivr.net/npm/face-api.js/weights",
+];
+
+const FACEAPI_CDNS = [
+  "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js",
+  "https://unpkg.com/@vladmandic/face-api/dist/face-api.js",
+];
 
 let modelsLoaded = false;
 let modelsLoading: Promise<void> | null = null;
+let modelLoadError: string | null = null;
 
 declare global {
   interface Window {
@@ -32,24 +40,56 @@ function loadScript(src: string): Promise<void> {
   });
 }
 
+async function loadScriptWithFallback(): Promise<void> {
+  let lastError: Error | null = null;
+  for (const cdn of FACEAPI_CDNS) {
+    try {
+      await loadScript(cdn);
+      return;
+    } catch (e) {
+      lastError = e as Error;
+    }
+  }
+  throw lastError ?? new Error("All face-api CDNs failed");
+}
+
+async function loadModelsFromUrl(modelUrl: string): Promise<void> {
+  const api = getFaceApi();
+  if (!api) throw new Error("face-api not loaded");
+  await Promise.all([
+    api.nets.tinyFaceDetector.loadFromUri(modelUrl),
+    api.nets.ssdMobilenetv1.loadFromUri(modelUrl),
+    api.nets.faceLandmark68TinyNet.loadFromUri(modelUrl),
+    api.nets.faceRecognitionNet.loadFromUri(modelUrl),
+  ]);
+}
+
 export async function ensureModelsLoaded(): Promise<void> {
   if (modelsLoaded) return;
   if (modelsLoading) return modelsLoading;
 
   modelsLoading = (async () => {
     try {
-      await loadScript(FACEAPI_CDN);
-      const api = getFaceApi();
-      if (!api) return;
-      await Promise.all([
-        api.nets.tinyFaceDetector.loadFromUri(MODEL_URL),
-        api.nets.ssdMobilenetv1.loadFromUri(MODEL_URL),
-        api.nets.faceLandmark68TinyNet.loadFromUri(MODEL_URL),
-        api.nets.faceRecognitionNet.loadFromUri(MODEL_URL),
-      ]);
-      modelsLoaded = true;
-    } catch {
-      // Models failed to load; will fall back to histogram
+      await loadScriptWithFallback();
+      let loaded = false;
+      for (const modelUrl of MODEL_URLS) {
+        try {
+          await loadModelsFromUrl(modelUrl);
+          loaded = true;
+          break;
+        } catch {
+          // try next
+        }
+      }
+      if (loaded) {
+        modelsLoaded = true;
+        modelLoadError = null;
+      } else {
+        modelLoadError =
+          "Could not load face recognition models. Using histogram fallback.";
+      }
+    } catch (e) {
+      modelLoadError = (e as Error).message ?? "Model load failed";
     }
   })();
 
@@ -58,6 +98,10 @@ export async function ensureModelsLoaded(): Promise<void> {
 
 export function areModelsLoaded(): boolean {
   return modelsLoaded;
+}
+
+export function getModelLoadError(): string | null {
+  return modelLoadError;
 }
 
 export async function loadImageToCanvas(
@@ -90,6 +134,55 @@ function loadHTMLImage(src: string): Promise<HTMLImageElement> {
     img.onerror = () => reject(new Error("Failed to load image"));
     img.src = src;
   });
+}
+
+/**
+ * Preprocess image for better face detection:
+ * - Resize to 224x224
+ * - Apply contrast normalization using 2nd/98th percentile stretch
+ */
+export async function preprocessImageForFace(
+  src: string,
+): Promise<HTMLImageElement> {
+  const imageData = await loadImageToCanvas(src, 224, 224);
+  const data = imageData.data;
+
+  // Collect grayscale values for percentile calculation
+  const grayValues: number[] = [];
+  for (let i = 0; i < data.length; i += 4) {
+    grayValues.push(
+      0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2],
+    );
+  }
+  grayValues.sort((a, b) => a - b);
+
+  const p2 = grayValues[Math.floor(grayValues.length * 0.02)] ?? 0;
+  const p98 = grayValues[Math.floor(grayValues.length * 0.98)] ?? 255;
+  const range = Math.max(p98 - p2, 1);
+
+  // Apply per-channel stretch based on same percentile range
+  for (let i = 0; i < data.length; i += 4) {
+    data[i] = Math.min(
+      255,
+      Math.max(0, Math.round(((data[i] - p2) / range) * 255)),
+    );
+    data[i + 1] = Math.min(
+      255,
+      Math.max(0, Math.round(((data[i + 1] - p2) / range) * 255)),
+    );
+    data[i + 2] = Math.min(
+      255,
+      Math.max(0, Math.round(((data[i + 2] - p2) / range) * 255)),
+    );
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = 224;
+  canvas.height = 224;
+  const ctx = canvas.getContext("2d")!;
+  ctx.putImageData(imageData, 0, 0);
+
+  return loadHTMLImage(canvas.toDataURL("image/jpeg", 0.92));
 }
 
 export function extractHistogram(imageData: ImageData): number[] {
@@ -182,17 +275,40 @@ function imageDataToDataUrl(imageData: ImageData): string {
   return canvas.toDataURL("image/jpeg", 0.85);
 }
 
+/**
+ * Improved distance-to-score calibration.
+ * distance <= 0.30 → 95-100 (very high confidence)
+ * distance <= 0.45 → 70-94 (likely match)
+ * distance <= 0.60 → 40-69 (possible match)
+ * distance > 0.60  → 0-39 (low)
+ */
+function distanceToScore(distance: number): number {
+  if (distance <= 0.3) {
+    return Math.round(95 + ((0.3 - distance) / 0.3) * 5);
+  }
+  if (distance <= 0.45) {
+    return Math.round(70 + ((0.45 - distance) / 0.15) * 24);
+  }
+  if (distance <= 0.6) {
+    return Math.round(40 + ((0.6 - distance) / 0.15) * 29);
+  }
+  return Math.max(0, Math.round(40 - ((distance - 0.6) / 0.4) * 40));
+}
+
 async function extractFaceDescriptor(
   imgEl: HTMLImageElement,
 ): Promise<Float32Array | null> {
   const api = getFaceApi();
   if (!api) return null;
   try {
-    // First attempt: TinyFaceDetector (fast)
+    // First attempt: TinyFaceDetector with higher input size for better accuracy
     let detection = await api
       .detectSingleFace(
         imgEl,
-        new api.TinyFaceDetectorOptions({ scoreThreshold: 0.3 }),
+        new api.TinyFaceDetectorOptions({
+          inputSize: 416,
+          scoreThreshold: 0.4,
+        }),
       )
       .withFaceLandmarks(true)
       .withFaceDescriptor();
@@ -214,6 +330,31 @@ async function extractFaceDescriptor(
   }
 }
 
+/**
+ * Detect whether a face is present in an image using TinyFaceDetector or SsdMobilenetv1.
+ */
+export async function detectFaceInImage(
+  imgEl: HTMLImageElement,
+): Promise<boolean> {
+  const api = getFaceApi();
+  if (!api) return false;
+  try {
+    let detection = await api.detectSingleFace(
+      imgEl,
+      new api.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.4 }),
+    );
+    if (!detection) {
+      detection = await api.detectSingleFace(
+        imgEl,
+        new api.SsdMobilenetv1Options({ minConfidence: 0.3 }),
+      );
+    }
+    return !!detection;
+  } catch {
+    return false;
+  }
+}
+
 async function extractDescriptorWithAgeTransform(
   imgEl: HTMLImageElement,
   ageFactor: number,
@@ -232,17 +373,6 @@ function descriptorDistance(a: Float32Array, b: Float32Array): number {
     sum += d * d;
   }
   return Math.sqrt(sum);
-}
-
-/**
- * Convert face-api Euclidean distance to 0-100 score.
- * face-api distances: <0.4 = same person, 0.4-0.6 = likely same, >0.6 = different
- * Map: 0.0 -> 100, 0.4 -> 85, 0.6 -> 50, 1.0 -> 0
- */
-function distanceToScore(distance: number): number {
-  if (distance <= 0.4) return Math.round(85 + ((0.4 - distance) / 0.4) * 15);
-  if (distance <= 0.6) return Math.round(50 + ((0.6 - distance) / 0.2) * 35);
-  return Math.max(0, Math.round(50 - ((distance - 0.6) / 0.4) * 50));
 }
 
 async function cnnMatchScore(
@@ -320,17 +450,42 @@ export async function computeMatchScore(
     }
 
     if (modelsLoaded) {
+      // Use preprocessed images for better face detection accuracy
       const [searchImg, caseImg] = await Promise.all([
-        loadHTMLImage(searchDataUrl),
-        loadHTMLImage(casePhotoUrl),
+        preprocessImageForFace(searchDataUrl).catch(() =>
+          loadHTMLImage(searchDataUrl),
+        ),
+        preprocessImageForFace(casePhotoUrl).catch(() =>
+          loadHTMLImage(casePhotoUrl),
+        ),
       ]);
 
       const cnnScore = await cnnMatchScore(searchImg, caseImg);
+
+      // Compute histogram similarity for ensemble
+      const [searchImageData, caseImageData] = await Promise.all([
+        loadImageToCanvas(searchDataUrl),
+        loadImageToCanvas(casePhotoUrl),
+      ]);
+      const histRaw = histogramIntersection(
+        extractHistogram(searchImageData),
+        extractHistogram(caseImageData),
+      );
+      const histScore = Math.max(
+        0,
+        Math.min(100, Math.round(((histRaw - 0.3) / 0.5) * 100)),
+      );
+
       if (cnnScore >= 0) {
-        return cnnScore;
+        // Weighted ensemble: CNN (85%) + histogram (15%)
+        return Math.round(cnnScore * 0.85 + histScore * 0.15);
       }
+
+      // CNN got no face, use histogram only
+      return histScore;
     }
 
+    // Models not loaded — histogram only
     const [searchImageData, caseImageData] = await Promise.all([
       loadImageToCanvas(searchDataUrl),
       loadImageToCanvas(casePhotoUrl),
@@ -362,11 +517,10 @@ export async function computeMatchScore(
     );
 
     const bestHistScore = Math.max(...histScores);
-    const normalized = Math.max(
+    return Math.max(
       0,
       Math.min(100, Math.round(((bestHistScore - 0.3) / 0.5) * 100)),
     );
-    return normalized;
   } catch {
     return 0;
   }

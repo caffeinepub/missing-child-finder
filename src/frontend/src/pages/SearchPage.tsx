@@ -27,9 +27,12 @@ import {
   useUpdateStatusToFound,
 } from "../hooks/useQueries";
 import {
+  areModelsLoaded,
   computeFrameVariance,
   computeMatchScore,
+  detectFaceInImage,
   ensureModelsLoaded,
+  extractHistogram,
   loadImageToCanvas,
 } from "../utils/imageAnalysis";
 
@@ -41,6 +44,7 @@ interface MatchResult {
 type SearchPhase =
   | "idle"
   | "loading-models"
+  | "preprocessing"
   | "analyzing"
   | "age-progression"
   | "fetching"
@@ -50,18 +54,28 @@ type SearchPhase =
 
 const PHASE_MESSAGES: Partial<Record<SearchPhase, string>> = {
   "loading-models": "Loading face recognition models...",
-  analyzing: "Analyzing photo using CNN face descriptor extraction...",
+  preprocessing: "Preprocessing image...",
+  analyzing: "Extracting face descriptors...",
   "age-progression": "Applying bi-directional age progression model...",
-  fetching: "Matching against registered cases with DeepFace/CNN pipeline...",
+  fetching: "Matching against registered cases...",
   "extracting-frames": "Extracting frames from video...",
   "analyzing-frames": "Analyzing frames with face recognition...",
 };
 
-const HIGH_CONFIDENCE_THRESHOLD = 40;
+function getMatchLabel(score: number): { label: string; className: string } {
+  if (score >= 60)
+    return { label: "Match Found", className: "bg-success/10 text-success" };
+  if (score >= 35)
+    return {
+      label: "Possible Match",
+      className: "bg-amber-500/10 text-amber-600",
+    };
+  return { label: "Low Match", className: "bg-muted text-muted-foreground" };
+}
 
 const extractFramesFromVideo = async (
   file: File,
-  numFrames = 10,
+  numFrames = 15,
 ): Promise<string[]> => {
   return new Promise((resolve) => {
     const video = document.createElement("video");
@@ -75,15 +89,53 @@ const extractFramesFromVideo = async (
       canvas.width = 320;
       canvas.height = 240;
       const ctx = canvas.getContext("2d")!;
-      for (let i = 0; i < numFrames; i++) {
-        const time = (duration / numFrames) * i;
+
+      // Skip first/last 5% of duration
+      const startTime = duration * 0.05;
+      const endTime = duration * 0.95;
+      const usableDuration = endTime - startTime;
+
+      let prevHist: number[] | null = null;
+      const collected: string[] = [];
+
+      for (let i = 0; i < numFrames * 2 && collected.length < numFrames; i++) {
+        const time = startTime + (usableDuration / (numFrames * 2 - 1)) * i;
+        if (time > endTime) break;
         video.currentTime = time;
         await new Promise((r) =>
           video.addEventListener("seeked", r, { once: true }),
         );
         ctx.drawImage(video, 0, 0, 320, 240);
-        frames.push(canvas.toDataURL("image/jpeg", 0.8));
+        const frameDataUrl = canvas.toDataURL("image/jpeg", 0.8);
+
+        // Skip near-identical frames (histogram diff < 0.05)
+        const imgData = ctx.getImageData(0, 0, 320, 240);
+        const hist = extractHistogram(imgData);
+        if (prevHist !== null) {
+          const diff = hist.reduce(
+            (sum, v, idx) => sum + Math.abs(v - prevHist![idx]),
+            0,
+          );
+          if (diff < 0.05) continue;
+        }
+        prevHist = hist;
+        collected.push(frameDataUrl);
       }
+
+      // Ensure we always get at least some frames even if all were skipped
+      if (collected.length === 0) {
+        for (let i = 0; i < Math.min(numFrames, 5); i++) {
+          const time = startTime + (usableDuration / 4) * i;
+          video.currentTime = time;
+          await new Promise((r) =>
+            video.addEventListener("seeked", r, { once: true }),
+          );
+          ctx.drawImage(video, 0, 0, 320, 240);
+          collected.push(canvas.toDataURL("image/jpeg", 0.8));
+        }
+      }
+
+      frames.push(...collected);
       URL.revokeObjectURL(url);
       resolve(frames);
     });
@@ -105,6 +157,7 @@ export default function SearchPage() {
   const [markingFound, setMarkingFound] = useState<string | null>(null);
   const [ageProgressedUrl, setAgeProgressedUrl] = useState<string | null>(null);
   const [alertMessage, setAlertMessage] = useState<string | null>(null);
+  const [modelsLoaded, setModelsLoaded] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
 
   // Video upload state
@@ -118,19 +171,24 @@ export default function SearchPage() {
 
   // Load face-api models in background on mount
   useEffect(() => {
-    ensureModelsLoaded().catch(() => {
-      // Silent fail -- will fall back to histogram matching
-    });
+    ensureModelsLoaded()
+      .then(() => {
+        setModelsLoaded(areModelsLoaded());
+      })
+      .catch(() => {
+        // Silent fail -- will fall back to histogram matching
+      });
   }, []);
 
   // Face detection state
   const [faceVariance, setFaceVariance] = useState(0);
+  const [faceDetectedByApi, setFaceDetectedByApi] = useState(false);
   const faceRafRef = useRef<number | null>(null);
   const offscreenCanvasRef = useRef<HTMLCanvasElement | null>(null);
 
   const camera = useCamera({ facingMode: "user" });
 
-  // Face detection loop
+  // Variance-based face detection loop (always runs as fallback)
   const runFaceDetectionLoop = useCallback(() => {
     if (!camera.videoRef.current || !camera.isActive) return;
 
@@ -173,6 +231,7 @@ export default function SearchPage() {
         faceRafRef.current = null;
       }
       setFaceVariance(0);
+      setFaceDetectedByApi(false);
     }
     return () => {
       if (faceRafRef.current !== null) {
@@ -182,8 +241,48 @@ export default function SearchPage() {
     };
   }, [camera.isActive, runFaceDetectionLoop]);
 
-  const faceStatus: "detected" | "partial" | "none" =
-    faceVariance > 800 ? "detected" : faceVariance > 300 ? "partial" : "none";
+  // face-api.js based face detection every 800ms when camera is active
+  useEffect(() => {
+    if (!camera.isActive || !modelsLoaded) return;
+
+    const interval = setInterval(async () => {
+      if (!camera.videoRef.current || camera.videoRef.current.readyState < 2)
+        return;
+      const video = camera.videoRef.current;
+
+      // Capture a frame to canvas
+      const captureCanvas = document.createElement("canvas");
+      captureCanvas.width = video.videoWidth || 320;
+      captureCanvas.height = video.videoHeight || 240;
+      const ctx = captureCanvas.getContext("2d");
+      if (!ctx) return;
+      ctx.drawImage(video, 0, 0, captureCanvas.width, captureCanvas.height);
+
+      const img = new Image();
+      img.src = captureCanvas.toDataURL("image/jpeg", 0.7);
+      await new Promise<void>((r) => {
+        img.onload = () => r();
+      });
+
+      const detected = await detectFaceInImage(img);
+      setFaceDetectedByApi(detected);
+    }, 800);
+
+    return () => clearInterval(interval);
+  }, [camera.isActive, modelsLoaded, camera.videoRef]);
+
+  // Combine variance + API detection for final status
+  const faceStatus: "detected" | "partial" | "none" = modelsLoaded
+    ? faceDetectedByApi
+      ? "detected"
+      : faceVariance > 300
+        ? "partial"
+        : "none"
+    : faceVariance > 800
+      ? "detected"
+      : faceVariance > 300
+        ? "partial"
+        : "none";
 
   const handlePhoto = (file: File) => {
     setPhoto(file);
@@ -212,8 +311,8 @@ export default function SearchPage() {
     setPhase("loading-models");
     setProgress(5);
 
-    // Ensure CNN models are loaded before searching
     await ensureModelsLoaded().catch(() => {});
+    setModelsLoaded(areModelsLoaded());
     setProgress(15);
 
     const dataUrl = await new Promise<string>((resolve, reject) => {
@@ -223,13 +322,16 @@ export default function SearchPage() {
       reader.readAsDataURL(activePhoto);
     });
 
-    setPhase("analyzing");
+    setPhase("preprocessing");
+    setProgress(25);
     await loadImageToCanvas(dataUrl);
+
+    setPhase("analyzing");
     setProgress(35);
 
     setPhase("age-progression");
-    await new Promise<void>((resolve) => setTimeout(resolve, 600));
-    setProgress(65);
+    await new Promise<void>((resolve) => setTimeout(resolve, 400));
+    setProgress(55);
 
     setPhase("fetching");
 
@@ -266,17 +368,19 @@ export default function SearchPage() {
     const allScored = [...scoredWithPhotos, ...scoredWithoutPhotos];
     allScored.sort((a, b) => b.score - a.score);
 
-    const confident = allScored.filter(
-      (r) => r.score >= HIGH_CONFIDENCE_THRESHOLD,
-    );
-    const topResult = confident.slice(0, 3);
+    // Always show top 3 regardless of score (only exclude zero-score no-photo cases)
+    const topResult = allScored
+      .filter((r) => r.record.photoId && r.record.photoId.trim() !== "")
+      .slice(0, 3);
 
+    // If no cases have photos, show "no results"
     setProgress(100);
     setPhase("done");
     setResults(topResult);
 
-    if (topResult.length > 0) {
-      const match = topResult[0];
+    const highConfidence = topResult.filter((r) => r.score >= 35);
+    if (highConfidence.length > 0) {
+      const match = highConfidence[0];
       const msg = `Match found for ${match.record.name} (Age: ${Number(match.record.age)}, Last seen: ${match.record.lastLocation}). Please contact authorities immediately.`;
       setAlertMessage(`Alert sent to ${match.record.contactNumber}: ${msg}`);
       try {
@@ -301,11 +405,12 @@ export default function SearchPage() {
     setProgress(5);
 
     await ensureModelsLoaded().catch(() => {});
+    setModelsLoaded(areModelsLoaded());
     setProgress(10);
 
     setPhase("extracting-frames");
     setVideoAnalysisMessage("Extracting frames from video...");
-    const frames = await extractFramesFromVideo(videoFile, 10);
+    const frames = await extractFramesFromVideo(videoFile, 15);
     setVideoFrameCount(frames.length);
     setProgress(25);
 
@@ -324,9 +429,8 @@ export default function SearchPage() {
 
     for (let fi = 0; fi < frames.length; fi++) {
       const frameDataUrl = frames[fi];
-      setVideoAnalysisMessage(
-        `Analyzing frame ${fi + 1} of ${frames.length}...`,
-      );
+      const faceMsg = `Analyzing frame ${fi + 1} of ${frames.length}...`;
+      setVideoAnalysisMessage(faceMsg);
       setProgress(25 + Math.round(((fi + 1) / frames.length) * 65));
 
       await Promise.all(
@@ -352,18 +456,19 @@ export default function SearchPage() {
     const allScored = [...scoredWithPhotos, ...scoredWithoutPhotos];
     allScored.sort((a, b) => b.score - a.score);
 
-    const confident = allScored.filter(
-      (r) => r.score >= HIGH_CONFIDENCE_THRESHOLD,
-    );
-    const topResult = confident.slice(0, 3);
+    // Always show top 3 regardless of score
+    const topResult = allScored
+      .filter((r) => r.record.photoId && r.record.photoId.trim() !== "")
+      .slice(0, 3);
 
     setProgress(100);
     setPhase("done");
     setResults(topResult);
     setVideoAnalysisMessage(null);
 
-    if (topResult.length > 0) {
-      const match = topResult[0];
+    const highConfidence = topResult.filter((r) => r.score >= 35);
+    if (highConfidence.length > 0) {
+      const match = highConfidence[0];
       const msg = `Match found for ${match.record.name} (Age: ${Number(match.record.age)}, Last seen: ${match.record.lastLocation}). Please contact authorities immediately.`;
       setAlertMessage(`Alert sent to ${match.record.contactNumber}: ${msg}`);
       try {
@@ -413,12 +518,16 @@ export default function SearchPage() {
 
   const isSearching =
     phase === "loading-models" ||
+    phase === "preprocessing" ||
     phase === "analyzing" ||
     phase === "age-progression" ||
     phase === "fetching" ||
     phase === "extracting-frames" ||
     phase === "analyzing-frames";
   const topMatch = results[0];
+  const hasRegisteredCasesWithPhotos = (allCases ?? []).some(
+    (c) => c.photoId && c.photoId.trim() !== "",
+  );
 
   return (
     <div className="min-h-screen bg-background flex flex-col">
@@ -652,7 +761,7 @@ export default function SearchPage() {
                     Supported formats: MP4, MOV, WebM
                   </p>
                   <p className="text-xs text-muted-foreground mt-0.5">
-                    10 frames will be extracted and analyzed for face matches
+                    Up to 15 frames extracted and analyzed for face matches
                   </p>
                   <input
                     ref={videoInputRef}
@@ -747,6 +856,11 @@ export default function SearchPage() {
                       )}
                       <span className="text-sm font-medium text-foreground">
                         Face Detection
+                        {modelsLoaded && (
+                          <span className="ml-1 text-xs text-muted-foreground font-normal">
+                            (CNN active)
+                          </span>
+                        )}
                       </span>
                     </div>
                     <span
@@ -1011,7 +1125,7 @@ export default function SearchPage() {
               animate={{ opacity: 1, y: 0 }}
               className="space-y-4"
             >
-              {topMatch && (
+              {topMatch && topMatch.score >= 35 && (
                 <Alert
                   className="border-destructive/40 bg-destructive/5"
                   data-ocid="search.toast"
@@ -1034,111 +1148,116 @@ export default function SearchPage() {
                 {results.length > 1 ? "es" : ""}
               </h2>
 
-              {results.map((result, idx) => (
-                <motion.div
-                  key={result.record.contactNumber}
-                  initial={{ opacity: 0, x: -10 }}
-                  animate={{ opacity: 1, x: 0 }}
-                  transition={{ delay: idx * 0.07 }}
-                  className="bg-card rounded-xl border border-border shadow-card p-5"
-                  data-ocid={`search.item.${idx + 1}`}
-                >
-                  <div className="flex items-start gap-4">
-                    <div className="w-16 h-16 rounded-xl overflow-hidden bg-muted shrink-0">
-                      {result.record.photoId ? (
-                        <img
-                          src={result.record.photoId}
-                          alt={result.record.name}
-                          className="w-full h-full object-cover"
-                          onError={(e) => {
-                            (e.target as HTMLImageElement).style.display =
-                              "none";
-                          }}
-                        />
-                      ) : (
-                        <div className="w-full h-full flex items-center justify-center">
-                          <span className="text-xl font-bold text-muted-foreground">
-                            {result.record.name.charAt(0)}
-                          </span>
-                        </div>
-                      )}
-                    </div>
-
-                    <div className="flex-1 min-w-0">
-                      <div className="flex items-start justify-between gap-2">
-                        <div>
-                          <div className="flex items-center gap-2 flex-wrap">
-                            <p className="font-semibold text-foreground">
-                              {result.record.name}
-                            </p>
-                            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-success/10 text-success">
-                              Match Found
+              {results.map((result, idx) => {
+                const matchInfo = getMatchLabel(result.score);
+                return (
+                  <motion.div
+                    key={result.record.contactNumber}
+                    initial={{ opacity: 0, x: -10 }}
+                    animate={{ opacity: 1, x: 0 }}
+                    transition={{ delay: idx * 0.07 }}
+                    className="bg-card rounded-xl border border-border shadow-card p-5"
+                    data-ocid={`search.item.${idx + 1}`}
+                  >
+                    <div className="flex items-start gap-4">
+                      <div className="w-16 h-16 rounded-xl overflow-hidden bg-muted shrink-0">
+                        {result.record.photoId ? (
+                          <img
+                            src={result.record.photoId}
+                            alt={result.record.name}
+                            className="w-full h-full object-cover"
+                            onError={(e) => {
+                              (e.target as HTMLImageElement).style.display =
+                                "none";
+                            }}
+                          />
+                        ) : (
+                          <div className="w-full h-full flex items-center justify-center">
+                            <span className="text-xl font-bold text-muted-foreground">
+                              {result.record.name.charAt(0)}
                             </span>
-                            {idx === 0 && (
-                              <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-primary/10 text-primary">
-                                Best Match
+                          </div>
+                        )}
+                      </div>
+
+                      <div className="flex-1 min-w-0">
+                        <div className="flex items-start justify-between gap-2">
+                          <div>
+                            <div className="flex items-center gap-2 flex-wrap">
+                              <p className="font-semibold text-foreground">
+                                {result.record.name}
+                              </p>
+                              <span
+                                className={`inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium ${matchInfo.className}`}
+                              >
+                                {matchInfo.label}
+                              </span>
+                              {idx === 0 && result.score >= 35 && (
+                                <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-primary/10 text-primary">
+                                  Best Match
+                                </span>
+                              )}
+                            </div>
+                            <p className="text-xs text-muted-foreground">
+                              Age {Number(result.record.age)} &bull;{" "}
+                              {result.record.lastLocation}
+                            </p>
+                            <p className="text-xs text-muted-foreground mt-0.5">
+                              Contact:{" "}
+                              <strong>{result.record.contactNumber}</strong>
+                            </p>
+                            {result.record.lastSeenPlace && (
+                              <p className="text-xs text-muted-foreground mt-0.5">
+                                Last seen:{" "}
+                                <strong>{result.record.lastSeenPlace}</strong>
+                              </p>
+                            )}
+                          </div>
+                        </div>
+
+                        <div className="flex items-center justify-between mt-3">
+                          <div className="flex items-center gap-2">
+                            {result.record.status === Status.active ? (
+                              <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-destructive/10 text-destructive">
+                                Active
+                              </span>
+                            ) : result.record.status === Status.found ? (
+                              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-success/10 text-success">
+                                <CheckCircle className="w-3 h-3" /> Found
+                              </span>
+                            ) : (
+                              <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-muted text-muted-foreground">
+                                {String(result.record.status)}
                               </span>
                             )}
                           </div>
-                          <p className="text-xs text-muted-foreground">
-                            Age {Number(result.record.age)} &bull;{" "}
-                            {result.record.lastLocation}
-                          </p>
-                          <p className="text-xs text-muted-foreground mt-0.5">
-                            Contact:{" "}
-                            <strong>{result.record.contactNumber}</strong>
-                          </p>
-                          {result.record.lastSeenPlace && (
-                            <p className="text-xs text-muted-foreground mt-0.5">
-                              Last seen:{" "}
-                              <strong>{result.record.lastSeenPlace}</strong>
-                            </p>
+                          {result.record.status === Status.active && (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              onClick={() =>
+                                handleMarkFound(result.record.contactNumber)
+                              }
+                              disabled={
+                                markingFound === result.record.contactNumber
+                              }
+                              data-ocid="search.confirm_button"
+                              className="text-xs gap-1 border-success/40 text-success hover:bg-success/10"
+                            >
+                              {markingFound === result.record.contactNumber ? (
+                                <Loader2 className="w-3 h-3 animate-spin" />
+                              ) : (
+                                <CheckCircle className="w-3 h-3" />
+                              )}
+                              Mark as Found
+                            </Button>
                           )}
                         </div>
-                      </div>
-
-                      <div className="flex items-center justify-between mt-3">
-                        <div className="flex items-center gap-2">
-                          {result.record.status === Status.active ? (
-                            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-destructive/10 text-destructive">
-                              Active
-                            </span>
-                          ) : result.record.status === Status.found ? (
-                            <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-xs font-medium bg-success/10 text-success">
-                              <CheckCircle className="w-3 h-3" /> Found
-                            </span>
-                          ) : (
-                            <span className="inline-flex items-center px-2 py-0.5 rounded-full text-xs font-medium bg-muted text-muted-foreground">
-                              {String(result.record.status)}
-                            </span>
-                          )}
-                        </div>
-                        {result.record.status === Status.active && (
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() =>
-                              handleMarkFound(result.record.contactNumber)
-                            }
-                            disabled={
-                              markingFound === result.record.contactNumber
-                            }
-                            data-ocid="search.confirm_button"
-                            className="text-xs gap-1 border-success/40 text-success hover:bg-success/10"
-                          >
-                            {markingFound === result.record.contactNumber ? (
-                              <Loader2 className="w-3 h-3 animate-spin" />
-                            ) : (
-                              <CheckCircle className="w-3 h-3" />
-                            )}
-                            Mark as Found
-                          </Button>
-                        )}
                       </div>
                     </div>
-                  </div>
-                </motion.div>
-              ))}
+                  </motion.div>
+                );
+              })}
             </motion.div>
           )}
         </AnimatePresence>
@@ -1150,11 +1269,14 @@ export default function SearchPage() {
           >
             <Search className="w-10 h-10 text-muted-foreground mx-auto mb-3" />
             <p className="font-medium text-foreground">
-              No confident match found
+              {hasRegisteredCasesWithPhotos
+                ? "No matches found"
+                : "No registered cases with photos"}
             </p>
             <p className="text-sm text-muted-foreground mt-1">
-              The uploaded photo or video does not closely match any registered
-              case. Try a clearer photo/video or check the registered cases.
+              {hasRegisteredCasesWithPhotos
+                ? "No cases could be analyzed. Try uploading a clearer photo."
+                : "Register missing children with photos first to enable face matching."}
             </p>
           </div>
         )}

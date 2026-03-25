@@ -19,7 +19,7 @@ import {
   X,
 } from "lucide-react";
 import { AnimatePresence, motion } from "motion/react";
-import { useEffect, useRef, useState } from "react";
+import { useRef, useState } from "react";
 import { Status } from "../backend";
 import Navbar from "../components/Navbar";
 import { useActor } from "../hooks/useActor";
@@ -65,6 +65,41 @@ function isCanisterStoppedError(msg: string): boolean {
   );
 }
 
+/**
+ * Compress an image data URL to ensure it fits within ICP's ~2MB message limit.
+ * Resizes to max 600x600 and encodes as JPEG at reduced quality.
+ */
+async function compressImage(dataUrl: string): Promise<string> {
+  return new Promise((resolve) => {
+    const img = new Image();
+    img.onload = () => {
+      const MAX_DIM = 600;
+      let { width, height } = img;
+      if (width > MAX_DIM || height > MAX_DIM) {
+        if (width > height) {
+          height = Math.round((height * MAX_DIM) / width);
+          width = MAX_DIM;
+        } else {
+          width = Math.round((width * MAX_DIM) / height);
+          height = MAX_DIM;
+        }
+      }
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) {
+        resolve(dataUrl);
+        return;
+      }
+      ctx.drawImage(img, 0, 0, width, height);
+      resolve(canvas.toDataURL("image/jpeg", 0.65));
+    };
+    img.onerror = () => resolve(dataUrl);
+    img.src = dataUrl;
+  });
+}
+
 export default function RegisterPage() {
   const navigate = useNavigate();
   const {
@@ -80,44 +115,29 @@ export default function RegisterPage() {
   const [errors, setErrors] = useState<Partial<FormData>>({});
   const [photoDataUrl, setPhotoDataUrl] = useState<string | null>(null);
   const [photoFileName, setPhotoFileName] = useState<string | null>(null);
+  const [isCompressing, setIsCompressing] = useState(false);
   const [isDragging, setIsDragging] = useState(false);
   const [successInfo, setSuccessInfo] = useState<{
     name: string;
     contact: string;
   } | null>(null);
   const [submitError, setSubmitError] = useState("");
-  const [retryCountdown, setRetryCountdown] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const countdownRef = useRef<ReturnType<typeof setInterval> | null>(null);
-
-  // Auto-retry countdown after IC0508 error
-  useEffect(() => {
-    if (retryCountdown <= 0) return;
-    countdownRef.current = setInterval(() => {
-      setRetryCountdown((c) => {
-        if (c <= 1) {
-          if (countdownRef.current) clearInterval(countdownRef.current);
-          setSubmitError("");
-          return 0;
-        }
-        return c - 1;
-      });
-    }, 1000);
-    return () => {
-      if (countdownRef.current) clearInterval(countdownRef.current);
-    };
-  }, [retryCountdown]);
 
   const handleField = (key: keyof FormData, val: string) => {
     setForm((p) => ({ ...p, [key]: val }));
     setErrors((p) => ({ ...p, [key]: undefined }));
   };
 
-  const handlePhoto = (file: File) => {
+  const handlePhoto = async (file: File) => {
     setPhotoFileName(file.name);
+    setIsCompressing(true);
     const reader = new FileReader();
-    reader.onload = () => {
-      setPhotoDataUrl(reader.result as string);
+    reader.onload = async () => {
+      const raw = reader.result as string;
+      const compressed = await compressImage(raw);
+      setPhotoDataUrl(compressed);
+      setIsCompressing(false);
     };
     reader.readAsDataURL(file);
   };
@@ -171,7 +191,6 @@ export default function RegisterPage() {
     } catch (err: unknown) {
       const msg: string = (err as { message?: string })?.message ?? "";
       if (isCanisterStoppedError(msg) && retries > 0) {
-        // Wait 3 seconds and retry automatically
         await new Promise((r) => setTimeout(r, 3000));
         return attemptRegister(retries - 1);
       }
@@ -182,7 +201,6 @@ export default function RegisterPage() {
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setSubmitError("");
-    setRetryCountdown(0);
 
     if (!identity) {
       setSubmitError(
@@ -200,20 +218,27 @@ export default function RegisterPage() {
       return;
     }
 
+    if (isCompressing) {
+      setSubmitError("Please wait for the photo to finish processing.");
+      return;
+    }
+
     try {
       await attemptRegister(3);
     } catch (err: unknown) {
       const msg: string = (err as { message?: string })?.message ?? "";
       if (isCanisterStoppedError(msg)) {
         setSubmitError(
-          "The backend is restarting. Retrying automatically in 30 seconds...",
+          "The backend is temporarily restarting. Please wait 30 seconds and try again.",
         );
-        setRetryCountdown(30);
-        // Auto-submit after 30 seconds
-        setTimeout(() => {
-          handleSubmit(new Event("submit") as unknown as React.FormEvent);
-        }, 30000);
-      } else if (msg.includes("Not authenticated")) {
+      } else if (msg.includes("already exists")) {
+        setSubmitError(
+          "A case with this contact number already exists. Please use a different contact number.",
+        );
+      } else if (
+        msg.includes("Not authenticated") ||
+        msg.includes("Unauthorized")
+      ) {
         setSubmitError(
           "Your session expired. Please log out and log in again.",
         );
@@ -224,7 +249,7 @@ export default function RegisterPage() {
   };
 
   const isSubmitDisabled =
-    isPending || actorLoading || !identity || retryCountdown > 0;
+    isPending || actorLoading || !identity || isCompressing;
 
   return (
     <div className="min-h-screen bg-background flex flex-col">
@@ -279,7 +304,7 @@ export default function RegisterPage() {
         )}
 
         {/* Actor error — failed after all retries */}
-        {!actor && !actorLoading && identity && actorError && (
+        {actorError && !actorLoading && identity && (
           <Alert
             variant="destructive"
             className="mb-6"
@@ -296,32 +321,6 @@ export default function RegisterPage() {
                 variant="outline"
                 onClick={() => refetchActor()}
                 className="shrink-0"
-                data-ocid="register.secondary_button"
-              >
-                <RefreshCw className="w-3 h-3 mr-1" />
-                Retry
-              </Button>
-            </AlertDescription>
-          </Alert>
-        )}
-
-        {/* Actor null without explicit error (race/transient) */}
-        {!actor && !actorLoading && identity && !actorError && (
-          <Alert
-            className="mb-6 border-yellow-200 bg-yellow-50 dark:border-yellow-800 dark:bg-yellow-950"
-            data-ocid="register.loading_state"
-          >
-            <AlertCircle className="h-4 w-4 text-yellow-600" />
-            <AlertDescription className="flex items-center justify-between gap-4 text-yellow-800 dark:text-yellow-200">
-              <span>
-                Backend session is still connecting. You can wait or click
-                Retry.
-              </span>
-              <Button
-                size="sm"
-                variant="outline"
-                onClick={() => refetchActor()}
-                className="shrink-0 border-yellow-400 text-yellow-700 hover:bg-yellow-100"
                 data-ocid="register.secondary_button"
               >
                 <RefreshCw className="w-3 h-3 mr-1" />
@@ -370,28 +369,22 @@ export default function RegisterPage() {
 
         {submitError && (
           <Alert
-            variant={retryCountdown > 0 ? "default" : "destructive"}
+            variant="destructive"
             className="mb-6"
             data-ocid="register.error_state"
           >
             <AlertCircle className="h-4 w-4" />
             <AlertDescription className="flex items-center justify-between gap-4">
-              <span>
-                {retryCountdown > 0
-                  ? `The backend is restarting. Auto-retrying in ${retryCountdown}s...`
-                  : submitError}
-              </span>
-              {retryCountdown <= 0 && (
-                <Button
-                  size="sm"
-                  variant="outline"
-                  onClick={() => setSubmitError("")}
-                  className="shrink-0"
-                  data-ocid="register.close_button"
-                >
-                  Dismiss
-                </Button>
-              )}
+              <span>{submitError}</span>
+              <Button
+                size="sm"
+                variant="outline"
+                onClick={() => setSubmitError("")}
+                className="shrink-0"
+                data-ocid="register.close_button"
+              >
+                Dismiss
+              </Button>
             </AlertDescription>
           </Alert>
         )}
@@ -551,7 +544,14 @@ export default function RegisterPage() {
                 etc.)
               </p>
 
-              {photoDataUrl ? (
+              {isCompressing && (
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Processing photo...
+                </div>
+              )}
+
+              {photoDataUrl && !isCompressing ? (
                 <div className="relative inline-block">
                   <img
                     src={photoDataUrl}
@@ -573,7 +573,7 @@ export default function RegisterPage() {
                     {photoFileName}
                   </p>
                 </div>
-              ) : (
+              ) : !isCompressing ? (
                 <button
                   type="button"
                   data-ocid="register.dropzone"
@@ -609,7 +609,7 @@ export default function RegisterPage() {
                     }}
                   />
                 </button>
-              )}
+              ) : null}
             </div>
           </div>
 
@@ -638,10 +638,10 @@ export default function RegisterPage() {
                   <Loader2 className="w-4 h-4 animate-spin" />
                   Connecting...
                 </span>
-              ) : retryCountdown > 0 ? (
+              ) : isCompressing ? (
                 <span className="flex items-center gap-2">
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  Retrying in {retryCountdown}s...
+                  Processing photo...
                 </span>
               ) : (
                 "Register Case"
