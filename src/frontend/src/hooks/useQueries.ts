@@ -97,7 +97,7 @@ export function useRegisterCase() {
         throw new Error("Backend not connected. Please wait and try again.");
 
       let lastError: unknown;
-      for (let attempt = 0; attempt < 3; attempt++) {
+      for (let attempt = 0; attempt < 4; attempt++) {
         try {
           await actor.registerCase(record);
           return;
@@ -107,8 +107,10 @@ export function useRegisterCase() {
           const isTransient =
             msg.includes("IC0508") ||
             msg.includes("is stopped") ||
-            msg.includes("canister is stopping");
-          if (isTransient && attempt < 2) {
+            msg.includes("stopped") ||
+            msg.includes("canister is stopping") ||
+            msg.includes("temporarily unavailable");
+          if (isTransient && attempt < 3) {
             await new Promise((resolve) =>
               setTimeout(resolve, 2000 * (attempt + 1)),
             );

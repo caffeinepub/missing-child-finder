@@ -43,7 +43,7 @@ export default function DashboardPage() {
       bg: "bg-primary/10",
     },
     {
-      label: "Active Active",
+      label: "Active Cases",
       value: stats ? Number(stats.activeCases) : "-",
       icon: AlertTriangle,
       color: "text-destructive",

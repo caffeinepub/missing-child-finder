@@ -1,16 +1,24 @@
 const CANVAS_SIZE = 64;
 const BINS = 32;
 
-const MODEL_URLS = [
-  "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model",
-  "https://cdn.jsdelivr.net/npm/face-api.js/weights",
-  "https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights",
-];
-
+// CDN list for face-api script -- tried in order
 const FACEAPI_CDNS = [
+  "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.js",
+  "https://unpkg.com/@vladmandic/face-api@1.7.13/dist/face-api.js",
   "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js",
   "https://unpkg.com/@vladmandic/face-api/dist/face-api.js",
-  "https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.js",
+  "https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js",
+  "https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js",
+];
+
+// CDN list for model weights -- tried in order
+const MODEL_URLS = [
+  "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model",
+  "https://unpkg.com/@vladmandic/face-api/model",
+  "https://cdn.jsdelivr.net/npm/face-api.js/weights",
+  "https://unpkg.com/face-api.js/weights",
+  "https://raw.githubusercontent.com/vladmandic/face-api/master/model",
+  "https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights",
 ];
 
 let modelsLoaded = false;
@@ -24,20 +32,22 @@ declare global {
   }
 }
 
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
 function getFaceApi(): any {
   return typeof window !== "undefined" ? window.faceapi : null;
 }
 
 function loadScript(src: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    if (document.querySelector(`script[src="${src}"]`)) {
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing) {
       resolve();
       return;
     }
     const script = document.createElement("script");
     script.src = src;
     script.onload = () => resolve();
-    script.onerror = () => reject(new Error(`Failed to load script: ${src}`));
+    script.onerror = () => reject(new Error(`Failed to load: ${src}`));
     document.head.appendChild(script);
   });
 }
@@ -47,7 +57,12 @@ async function loadScriptWithFallback(): Promise<void> {
   for (const cdn of FACEAPI_CDNS) {
     try {
       await loadScript(cdn);
-      return;
+      // Wait up to 500ms for faceapi to initialize on window
+      for (let i = 0; i < 10; i++) {
+        if (getFaceApi()) return;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      if (getFaceApi()) return;
     } catch (e) {
       lastError = e as Error;
     }
@@ -61,7 +76,7 @@ async function loadModelsFromUrl(modelUrl: string): Promise<void> {
   await Promise.all([
     api.nets.tinyFaceDetector.loadFromUri(modelUrl),
     api.nets.ssdMobilenetv1.loadFromUri(modelUrl),
-    api.nets.faceLandmark68TinyNet.loadFromUri(modelUrl),
+    api.nets.faceLandmark68Net.loadFromUri(modelUrl),
     api.nets.faceRecognitionNet.loadFromUri(modelUrl),
   ]);
 }
@@ -80,7 +95,7 @@ export async function ensureModelsLoaded(): Promise<void> {
           loaded = true;
           break;
         } catch {
-          // try next
+          // try next CDN
         }
       }
       if (loaded) {
@@ -89,11 +104,11 @@ export async function ensureModelsLoaded(): Promise<void> {
       } else {
         modelLoadError =
           "Could not load face recognition models. Using histogram fallback.";
-        modelsLoading = null; // allow retry on next call
+        modelsLoading = null; // allow retry
       }
     } catch (e) {
       modelLoadError = (e as Error).message ?? "Model load failed";
-      modelsLoading = null; // allow retry on next call
+      modelsLoading = null; // allow retry
     }
   })();
 
@@ -141,17 +156,16 @@ function loadHTMLImage(src: string): Promise<HTMLImageElement> {
 }
 
 /**
- * Preprocess image for better face detection:
- * - Resize to 224x224
- * - Apply contrast normalization using 2nd/98th percentile stretch
+ * Resize image to targetSize x targetSize and apply contrast normalization
+ * (2nd / 98th percentile stretch) before face detection.
  */
 export async function preprocessImageForFace(
   src: string,
+  targetSize = 224,
 ): Promise<HTMLImageElement> {
-  const imageData = await loadImageToCanvas(src, 224, 224);
+  const imageData = await loadImageToCanvas(src, targetSize, targetSize);
   const data = imageData.data;
 
-  // Collect grayscale values for percentile calculation
   const grayValues: number[] = [];
   for (let i = 0; i < data.length; i += 4) {
     grayValues.push(
@@ -164,7 +178,6 @@ export async function preprocessImageForFace(
   const p98 = grayValues[Math.floor(grayValues.length * 0.98)] ?? 255;
   const range = Math.max(p98 - p2, 1);
 
-  // Apply per-channel stretch based on same percentile range
   for (let i = 0; i < data.length; i += 4) {
     data[i] = Math.min(
       255,
@@ -181,12 +194,12 @@ export async function preprocessImageForFace(
   }
 
   const canvas = document.createElement("canvas");
-  canvas.width = 224;
-  canvas.height = 224;
+  canvas.width = targetSize;
+  canvas.height = targetSize;
   const ctx = canvas.getContext("2d")!;
   ctx.putImageData(imageData, 0, 0);
 
-  return loadHTMLImage(canvas.toDataURL("image/jpeg", 0.92));
+  return loadHTMLImage(canvas.toDataURL("image/jpeg", 0.95));
 }
 
 export function extractHistogram(imageData: ImageData): number[] {
@@ -218,7 +231,7 @@ export function histogramIntersection(h1: number[], h2: number[]): number {
 
 /**
  * Apply pixel-level age progression transform.
- * ageFactor > 0 = age forward, ageFactor < 0 = de-age (make younger)
+ * ageFactor > 0 = age forward, ageFactor < 0 = de-age
  */
 export function applyAgeProgression(
   imageData: ImageData,
@@ -276,66 +289,89 @@ function imageDataToDataUrl(imageData: ImageData): string {
   const ctx = canvas.getContext("2d");
   if (!ctx) return "";
   ctx.putImageData(imageData, 0, 0);
-  return canvas.toDataURL("image/jpeg", 0.85);
+  return canvas.toDataURL("image/jpeg", 0.9);
 }
 
 /**
- * Improved distance-to-score calibration.
- * distance <= 0.30 → 95-100 (very high confidence)
- * distance <= 0.45 → 70-94 (likely match)
- * distance <= 0.60 → 40-69 (possible match)
- * distance > 0.60  → 0-39 (low)
+ * Distance to score:
+ * <= 0.28 → 90-100 (very high confidence)
+ * <= 0.42 → 65-89 (likely match)
+ * <= 0.58 → 35-64 (possible)
+ * > 0.58  → 0-34 (low)
  */
 function distanceToScore(distance: number): number {
-  if (distance <= 0.3) {
-    return Math.round(95 + ((0.3 - distance) / 0.3) * 5);
-  }
-  if (distance <= 0.45) {
-    return Math.round(70 + ((0.45 - distance) / 0.15) * 24);
-  }
-  if (distance <= 0.6) {
-    return Math.round(40 + ((0.6 - distance) / 0.15) * 29);
-  }
-  return Math.max(0, Math.round(40 - ((distance - 0.6) / 0.4) * 40));
+  if (distance <= 0.28) return Math.round(90 + ((0.28 - distance) / 0.28) * 10);
+  if (distance <= 0.42) return Math.round(65 + ((0.42 - distance) / 0.14) * 24);
+  if (distance <= 0.58) return Math.round(35 + ((0.58 - distance) / 0.16) * 29);
+  return Math.max(0, Math.round(35 - ((distance - 0.58) / 0.42) * 35));
 }
 
+/**
+ * Try multiple detection strategies to extract a face descriptor:
+ * 1. TinyFaceDetector (fast, good for clear faces)
+ * 2. SsdMobilenetv1 at low confidence (better recall)
+ * 3. SsdMobilenetv1 with even lower threshold (last resort)
+ */
 async function extractFaceDescriptor(
   imgEl: HTMLImageElement,
 ): Promise<Float32Array | null> {
   const api = getFaceApi();
   if (!api) return null;
-  try {
-    // First attempt: TinyFaceDetector with higher input size for better accuracy
-    let detection = await api
-      .detectSingleFace(
-        imgEl,
-        new api.TinyFaceDetectorOptions({
-          inputSize: 416,
-          scoreThreshold: 0.4,
-        }),
-      )
-      .withFaceLandmarks(true)
-      .withFaceDescriptor();
 
-    // Second attempt: SsdMobilenetv1 (more accurate, higher recall)
-    if (!detection) {
-      detection = await api
+  const strategies = [
+    () =>
+      api
+        .detectSingleFace(
+          imgEl,
+          new api.TinyFaceDetectorOptions({
+            inputSize: 416,
+            scoreThreshold: 0.4,
+          }),
+        )
+        .withFaceLandmarks()
+        .withFaceDescriptor(),
+    () =>
+      api
         .detectSingleFace(
           imgEl,
           new api.SsdMobilenetv1Options({ minConfidence: 0.3 }),
         )
-        .withFaceLandmarks(true)
-        .withFaceDescriptor();
-    }
+        .withFaceLandmarks()
+        .withFaceDescriptor(),
+    () =>
+      api
+        .detectSingleFace(
+          imgEl,
+          new api.SsdMobilenetv1Options({ minConfidence: 0.15 }),
+        )
+        .withFaceLandmarks()
+        .withFaceDescriptor(),
+    () =>
+      api
+        .detectSingleFace(
+          imgEl,
+          new api.TinyFaceDetectorOptions({
+            inputSize: 608,
+            scoreThreshold: 0.25,
+          }),
+        )
+        .withFaceLandmarks()
+        .withFaceDescriptor(),
+  ];
 
-    return detection?.descriptor ?? null;
-  } catch {
-    return null;
+  for (const strategy of strategies) {
+    try {
+      const detection = await strategy();
+      if (detection?.descriptor) return detection.descriptor;
+    } catch {
+      // try next
+    }
   }
+  return null;
 }
 
 /**
- * Detect whether a face is present in an image using TinyFaceDetector or SsdMobilenetv1.
+ * Detect whether a face is present.
  */
 export async function detectFaceInImage(
   imgEl: HTMLImageElement,
@@ -343,17 +379,16 @@ export async function detectFaceInImage(
   const api = getFaceApi();
   if (!api) return false;
   try {
-    let detection = await api.detectSingleFace(
+    let d = await api.detectSingleFace(
       imgEl,
-      new api.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.4 }),
+      new api.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.35 }),
     );
-    if (!detection) {
-      detection = await api.detectSingleFace(
+    if (!d)
+      d = await api.detectSingleFace(
         imgEl,
-        new api.SsdMobilenetv1Options({ minConfidence: 0.3 }),
+        new api.SsdMobilenetv1Options({ minConfidence: 0.25 }),
       );
-    }
-    return !!detection;
+    return !!d;
   } catch {
     return false;
   }
@@ -363,11 +398,15 @@ async function extractDescriptorWithAgeTransform(
   imgEl: HTMLImageElement,
   ageFactor: number,
 ): Promise<Float32Array | null> {
-  const imgData = await loadImageToCanvas(imgEl.src, 224, 224);
-  const transformed = applyAgeProgression(imgData, ageFactor);
-  const dataUrl = imageDataToDataUrl(transformed);
-  const transformedImg = await loadHTMLImage(dataUrl);
-  return extractFaceDescriptor(transformedImg);
+  try {
+    const imgData = await loadImageToCanvas(imgEl.src, 224, 224);
+    const transformed = applyAgeProgression(imgData, ageFactor);
+    const dataUrl = imageDataToDataUrl(transformed);
+    const transformedImg = await loadHTMLImage(dataUrl);
+    return extractFaceDescriptor(transformedImg);
+  } catch {
+    return null;
+  }
 }
 
 function descriptorDistance(a: Float32Array, b: Float32Array): number {
@@ -379,49 +418,44 @@ function descriptorDistance(a: Float32Array, b: Float32Array): number {
   return Math.sqrt(sum);
 }
 
+/**
+ * CNN-based face match score using multiple age-progression variants.
+ * Returns -1 if no face was detected in either image.
+ */
 async function cnnMatchScore(
   searchImg: HTMLImageElement,
   caseImg: HTMLImageElement,
 ): Promise<number> {
+  // Extract descriptors for both images in parallel
   const [searchDesc, caseDesc] = await Promise.all([
     extractFaceDescriptor(searchImg),
     extractFaceDescriptor(caseImg),
   ]);
 
+  // If we can't detect a face in the case photo, skip CNN for this case
+  if (!caseDesc) return -1;
+
+  // If we can't detect a face in the search image, skip CNN
+  if (!searchDesc) return -1;
+
   const scores: number[] = [];
+  const baseScore = distanceToScore(descriptorDistance(searchDesc, caseDesc));
+  scores.push(baseScore);
 
-  if (searchDesc && caseDesc) {
-    scores.push(distanceToScore(descriptorDistance(searchDesc, caseDesc)));
+  // Age progression variants (run in parallel)
+  const [agedSearch, youngSearch, agedCase] = await Promise.all([
+    extractDescriptorWithAgeTransform(searchImg, 0.6),
+    extractDescriptorWithAgeTransform(searchImg, -0.5),
+    extractDescriptorWithAgeTransform(caseImg, 0.6),
+  ]);
 
-    const agedSearchDesc = await extractDescriptorWithAgeTransform(
-      searchImg,
-      0.6,
-    );
-    if (agedSearchDesc) {
-      scores.push(
-        distanceToScore(descriptorDistance(agedSearchDesc, caseDesc)),
-      );
-    }
+  if (agedSearch)
+    scores.push(distanceToScore(descriptorDistance(agedSearch, caseDesc)));
+  if (youngSearch)
+    scores.push(distanceToScore(descriptorDistance(youngSearch, caseDesc)));
+  if (agedCase)
+    scores.push(distanceToScore(descriptorDistance(searchDesc, agedCase)));
 
-    const youngSearchDesc = await extractDescriptorWithAgeTransform(
-      searchImg,
-      -0.5,
-    );
-    if (youngSearchDesc) {
-      scores.push(
-        distanceToScore(descriptorDistance(youngSearchDesc, caseDesc)),
-      );
-    }
-
-    const agedCaseDesc = await extractDescriptorWithAgeTransform(caseImg, 0.6);
-    if (agedCaseDesc) {
-      scores.push(
-        distanceToScore(descriptorDistance(searchDesc, agedCaseDesc)),
-      );
-    }
-  }
-
-  if (scores.length === 0) return -1;
   return Math.max(...scores);
 }
 
@@ -453,8 +487,22 @@ export async function computeMatchScore(
       onAgeProgressedDataUrl(imageDataToDataUrl(aged));
     }
 
+    // Compute histogram score regardless of CNN (used for ensemble or fallback)
+    const [searchImageData, caseImageData] = await Promise.all([
+      loadImageToCanvas(searchDataUrl),
+      loadImageToCanvas(casePhotoUrl),
+    ]);
+    const histRaw = histogramIntersection(
+      extractHistogram(searchImageData),
+      extractHistogram(caseImageData),
+    );
+    // Histogram score normalized: intersections below 0.3 → 0, above 0.8 → 100
+    const histScore = Math.max(
+      0,
+      Math.min(100, Math.round(((histRaw - 0.3) / 0.5) * 100)),
+    );
+
     if (modelsLoaded) {
-      // Use preprocessed images for better face detection accuracy
       const [searchImg, caseImg] = await Promise.all([
         preprocessImageForFace(searchDataUrl).catch(() =>
           loadHTMLImage(searchDataUrl),
@@ -466,65 +514,39 @@ export async function computeMatchScore(
 
       const cnnScore = await cnnMatchScore(searchImg, caseImg);
 
-      // Compute histogram similarity for ensemble
-      const [searchImageData, caseImageData] = await Promise.all([
-        loadImageToCanvas(searchDataUrl),
-        loadImageToCanvas(casePhotoUrl),
-      ]);
-      const histRaw = histogramIntersection(
-        extractHistogram(searchImageData),
-        extractHistogram(caseImageData),
-      );
-      const histScore = Math.max(
-        0,
-        Math.min(100, Math.round(((histRaw - 0.3) / 0.5) * 100)),
-      );
-
       if (cnnScore >= 0) {
-        // Weighted ensemble: CNN (85%) + histogram (15%)
-        return Math.round(cnnScore * 0.85 + histScore * 0.15);
+        // Weighted ensemble: CNN (88%) + histogram (12%)
+        return Math.round(cnnScore * 0.88 + histScore * 0.12);
       }
 
-      // CNN got no face, use histogram only
-      return histScore;
+      // CNN got no face -- discount histogram heavily
+      return Math.round(histScore * 0.4);
     }
 
-    // Models not loaded — histogram only
-    const [searchImageData, caseImageData] = await Promise.all([
-      loadImageToCanvas(searchDataUrl),
-      loadImageToCanvas(casePhotoUrl),
-    ]);
-
-    const histScores: number[] = [];
+    // Models not loaded -- histogram only with age variants
     const caseHist = extractHistogram(caseImageData);
-
-    histScores.push(
+    const histScores = [
       histogramIntersection(extractHistogram(searchImageData), caseHist),
-    );
-    histScores.push(
       histogramIntersection(
         extractHistogram(applyAgeProgression(searchImageData, 0.6)),
         caseHist,
       ),
-    );
-    histScores.push(
       histogramIntersection(
         extractHistogram(applyAgeProgression(searchImageData, -0.5)),
         caseHist,
       ),
-    );
-    histScores.push(
       histogramIntersection(
         extractHistogram(searchImageData),
         extractHistogram(applyAgeProgression(caseImageData, 0.6)),
       ),
-    );
+    ];
 
-    const bestHistScore = Math.max(...histScores);
-    return Math.max(
+    const bestHistRaw = Math.max(...histScores);
+    const rawScore = Math.max(
       0,
-      Math.min(100, Math.round(((bestHistScore - 0.3) / 0.5) * 100)),
+      Math.min(100, Math.round(((bestHistRaw - 0.3) / 0.5) * 100)),
     );
+    return Math.round(rawScore * 0.4);
   } catch {
     return 0;
   }
