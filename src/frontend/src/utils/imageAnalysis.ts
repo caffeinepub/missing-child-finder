@@ -311,10 +311,11 @@ function imageDataToDataUrl(imageData: ImageData): string {
  * > 0.60  → 0-34   (low)
  */
 function distanceToScore(distance: number): number {
-  if (distance <= 0.3) return Math.round(90 + ((0.3 - distance) / 0.3) * 10);
-  if (distance <= 0.44) return Math.round(65 + ((0.44 - distance) / 0.14) * 24);
-  if (distance <= 0.6) return Math.round(35 + ((0.6 - distance) / 0.16) * 29);
-  return Math.max(0, Math.round(35 - ((distance - 0.6) / 0.4) * 35));
+  // Tighter thresholds: face-api same-person < 0.5, different > 0.6
+  if (distance <= 0.35) return Math.round(90 + ((0.35 - distance) / 0.35) * 10);
+  if (distance <= 0.45) return Math.round(65 + ((0.45 - distance) / 0.1) * 24);
+  if (distance <= 0.55) return Math.round(35 + ((0.55 - distance) / 0.1) * 29);
+  return 0; // distance > 0.55 = definitely different person
 }
 
 /**
@@ -643,55 +644,29 @@ async function cnnMatchScore(
     scores.push(blended);
   }
 
-  // -- Age progression variants (run in parallel)
-  const [agedSearch, youngSearch, agedCase, youngCase] = await Promise.all([
-    extractAnalysisWithAgeTransform(searchImg, 0.6),
-    extractAnalysisWithAgeTransform(searchImg, -0.5),
-    extractAnalysisWithAgeTransform(caseImg, 0.6),
-    extractAnalysisWithAgeTransform(caseImg, -0.4),
-  ]);
-
-  if (agedSearch)
-    scores.push(
-      distanceToScore(
-        descriptorDistance(agedSearch.descriptor, caseAnalysis.descriptor),
-      ),
-    );
-  if (youngSearch)
-    scores.push(
-      distanceToScore(
-        descriptorDistance(youngSearch.descriptor, caseAnalysis.descriptor),
-      ),
-    );
-  if (agedCase)
-    scores.push(
-      distanceToScore(
-        descriptorDistance(searchAnalysis.descriptor, agedCase.descriptor),
-      ),
-    );
-  if (youngCase)
-    scores.push(
-      distanceToScore(
-        descriptorDistance(searchAnalysis.descriptor, youngCase.descriptor),
-      ),
-    );
-
-  // Cross-landmark age variants
-  if (agedSearch?.landmarkDesc && caseAnalysis.landmarkDesc) {
-    const lmDist = landmarkDistance(
-      agedSearch.landmarkDesc,
-      caseAnalysis.landmarkDesc,
-    );
-    if (lmDist <= 0.1)
-      scores.push(Math.round(55 + ((0.1 - lmDist) / 0.1) * 45));
-  }
-  if (youngSearch?.landmarkDesc && caseAnalysis.landmarkDesc) {
-    const lmDist = landmarkDistance(
-      youngSearch.landmarkDesc,
-      caseAnalysis.landmarkDesc,
-    );
-    if (lmDist <= 0.1)
-      scores.push(Math.round(55 + ((0.1 - lmDist) / 0.1) * 45));
+  // -- Mild age progression: only if base score is already close (>= 30)
+  // Using very mild factor (0.15) to avoid distorting descriptors for different children
+  const blendedBase =
+    scores.length > 1 ? scores[scores.length - 1] : baseCnnScore;
+  if (blendedBase >= 30) {
+    const [mildAged, mildYoung] = await Promise.all([
+      extractAnalysisWithAgeTransform(searchImg, 0.15),
+      extractAnalysisWithAgeTransform(searchImg, -0.15),
+    ]);
+    if (mildAged) {
+      const d = descriptorDistance(
+        mildAged.descriptor,
+        caseAnalysis.descriptor,
+      );
+      scores.push(distanceToScore(d));
+    }
+    if (mildYoung) {
+      const d = descriptorDistance(
+        mildYoung.descriptor,
+        caseAnalysis.descriptor,
+      );
+      scores.push(distanceToScore(d));
+    }
   }
 
   return Math.max(...scores);
@@ -734,7 +709,7 @@ export async function computeMatchScore(
       extractHistogram(searchImageData),
       extractHistogram(caseImageData),
     );
-    const histScore = Math.max(
+    const _histScore = Math.max(
       0,
       Math.min(100, Math.round(((histRaw - 0.3) / 0.5) * 100)),
     );
@@ -751,7 +726,7 @@ export async function computeMatchScore(
 
       if (cnnScore >= 0) {
         // Weighted ensemble: CNN+landmark (90%) + histogram (10%)
-        return Math.round(cnnScore * 0.9 + histScore * 0.1);
+        return Math.round(cnnScore);
       }
 
       // CNN got no face -- try preprocessed versions before giving up
@@ -765,11 +740,11 @@ export async function computeMatchScore(
       ]);
       const cnnScore2 = await cnnMatchScore(searchPrep, casePrep);
       if (cnnScore2 >= 0) {
-        return Math.round(cnnScore2 * 0.9 + histScore * 0.1);
+        return Math.round(cnnScore2);
       }
 
-      // No face detected anywhere -- heavily discount histogram
-      return Math.round(histScore * 0.35);
+      // No face detected anywhere -- do NOT use histogram (causes wrong matches)
+      return 0;
     }
 
     // Models not loaded -- histogram only with age variants

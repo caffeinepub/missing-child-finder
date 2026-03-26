@@ -63,7 +63,7 @@ const PHASE_MESSAGES: Partial<Record<SearchPhase, string>> = {
 };
 
 function getMatchLabel(score: number): { label: string; className: string } {
-  if (score >= 60)
+  if (score >= 65)
     return { label: "Match Found", className: "bg-success/10 text-success" };
   if (score >= 35)
     return {
@@ -368,9 +368,12 @@ export default function SearchPage() {
     const allScored = [...scoredWithPhotos, ...scoredWithoutPhotos];
     allScored.sort((a, b) => b.score - a.score);
 
-    // Always show top 3 regardless of score (only exclude zero-score no-photo cases)
+    // Only show cases with score > 0 (score 0 = face not detected or definitely different person)
     const topResult = allScored
-      .filter((r) => r.record.photoId && r.record.photoId.trim() !== "")
+      .filter(
+        (r) =>
+          r.record.photoId && r.record.photoId.trim() !== "" && r.score > 0,
+      )
       .slice(0, 3);
 
     // If no cases have photos, show "no results"
@@ -436,9 +439,10 @@ export default function SearchPage() {
       await Promise.all(
         casesWithPhotos.map(async (record) => {
           const score = await computeMatchScore(frameDataUrl, record.photoId);
-          const existing = caseScores.get(record.contactNumber) ?? 0;
+          const caseKey = String(record.name) + String(record.age);
+          const existing = caseScores.get(caseKey) ?? 0;
           if (score > existing) {
-            caseScores.set(record.contactNumber, score);
+            caseScores.set(caseKey, score);
           }
         }),
       );
@@ -446,7 +450,7 @@ export default function SearchPage() {
 
     const scoredWithPhotos: MatchResult[] = casesWithPhotos.map((record) => ({
       record,
-      score: caseScores.get(record.contactNumber) ?? 0,
+      score: caseScores.get(String(record.name) + String(record.age)) ?? 0,
     }));
 
     const scoredWithoutPhotos: MatchResult[] = casesWithoutPhotos.map(
@@ -456,9 +460,12 @@ export default function SearchPage() {
     const allScored = [...scoredWithPhotos, ...scoredWithoutPhotos];
     allScored.sort((a, b) => b.score - a.score);
 
-    // Always show top 3 regardless of score
+    // Only show cases with score > 0 (score 0 = face not detected or definitely different person)
     const topResult = allScored
-      .filter((r) => r.record.photoId && r.record.photoId.trim() !== "")
+      .filter(
+        (r) =>
+          r.record.photoId && r.record.photoId.trim() !== "" && r.score > 0,
+      )
       .slice(0, 3);
 
     setProgress(100);
