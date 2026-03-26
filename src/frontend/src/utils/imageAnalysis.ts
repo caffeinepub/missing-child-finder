@@ -243,6 +243,7 @@ export function histogramIntersection(h1: number[], h2: number[]): number {
 
 /**
  * Apply pixel-level age progression transform.
+ * Used only for UI preview display -- NOT used in CNN matching pipeline.
  */
 export function applyAgeProgression(
   imageData: ImageData,
@@ -304,18 +305,17 @@ function imageDataToDataUrl(imageData: ImageData): string {
 }
 
 /**
- * Distance to score:
- * <= 0.30 → 90-100 (very high confidence)
- * <= 0.44 → 65-89  (likely match)
- * <= 0.60 → 35-64  (possible)
- * > 0.60  → 0-34   (low)
+ * Distance to score (tightened to 0.45 cutoff):
+ * <= 0.30 → 90-100  (very high confidence -- same person)
+ * <= 0.38 → 70-89   (likely match)
+ * <= 0.45 → 40-69   (possible match)
+ * > 0.45  → 0       (different person -- do not show)
  */
 function distanceToScore(distance: number): number {
-  // Tighter thresholds: face-api same-person < 0.5, different > 0.6
-  if (distance <= 0.35) return Math.round(90 + ((0.35 - distance) / 0.35) * 10);
-  if (distance <= 0.45) return Math.round(65 + ((0.45 - distance) / 0.1) * 24);
-  if (distance <= 0.55) return Math.round(35 + ((0.55 - distance) / 0.1) * 29);
-  return 0; // distance > 0.55 = definitely different person
+  if (distance <= 0.3) return Math.round(90 + ((0.3 - distance) / 0.3) * 10);
+  if (distance <= 0.38) return Math.round(70 + ((0.38 - distance) / 0.08) * 20);
+  if (distance <= 0.45) return Math.round(40 + ((0.45 - distance) / 0.07) * 30);
+  return 0; // distance > 0.45 = different person, do not show
 }
 
 /**
@@ -578,26 +578,13 @@ function descriptorDistance(a: Float32Array, b: Float32Array): number {
   return Math.sqrt(sum);
 }
 
-async function extractAnalysisWithAgeTransform(
-  imgEl: HTMLImageElement,
-  ageFactor: number,
-): Promise<FaceAnalysis | null> {
-  try {
-    const imgData = await loadImageToCanvas(imgEl.src, 320, 320);
-    const transformed = applyAgeProgression(imgData, ageFactor);
-    const dataUrl = imageDataToDataUrl(transformed);
-    const transformedImg = await loadHTMLImage(dataUrl);
-    return extractFullFaceAnalysis(transformedImg);
-  } catch {
-    return null;
-  }
-}
-
 /**
  * Comprehensive face match score:
- * - CNN 128-dim descriptor distance (primary signal)
- * - 68-point landmark geometry distance (secondary signal for face structure)
- * - Age-progression variants (aging + de-aging)
+ * - CNN 128-dim descriptor distance (primary signal, 100% weight when CNN dist >= 0.40)
+ * - 68-point landmark geometry distance (secondary signal, only when CNN dist < 0.40)
+ *   Blend: 80% CNN + 20% landmark when landmarks available AND cnnDist < 0.40
+ * - Age progression is NOT applied here -- it distorts 128-dim CNN descriptor spaces
+ *   and causes false positives. Age progression is used only for UI preview.
  * Returns -1 if no face detected in either image.
  */
 async function cnnMatchScore(
@@ -611,18 +598,20 @@ async function cnnMatchScore(
 
   if (!caseAnalysis || !searchAnalysis) return -1;
 
-  const scores: number[] = [];
-
-  // -- CNN descriptor score (primary)
+  // -- CNN descriptor score (primary signal)
   const cnnDist = descriptorDistance(
     searchAnalysis.descriptor,
     caseAnalysis.descriptor,
   );
   const baseCnnScore = distanceToScore(cnnDist);
-  scores.push(baseCnnScore);
 
-  // -- Landmark geometry score (structural face matching)
-  if (searchAnalysis.landmarkDesc && caseAnalysis.landmarkDesc) {
+  // -- Landmark geometry score (secondary signal, only when CNN distance is already plausible)
+  // Only blend landmarks when cnnDist < 0.40 -- don't let landmarks rescue a bad CNN score.
+  if (
+    cnnDist < 0.4 &&
+    searchAnalysis.landmarkDesc &&
+    caseAnalysis.landmarkDesc
+  ) {
     const lmDist = landmarkDistance(
       searchAnalysis.landmarkDesc,
       caseAnalysis.landmarkDesc,
@@ -639,37 +628,12 @@ async function cnnMatchScore(
               ? Math.round(30 + ((0.15 - lmDist) / 0.05) * 25)
               : Math.max(0, Math.round(30 - ((lmDist - 0.15) / 0.15) * 30));
 
-    // Blend CNN + landmark geometry: 70% CNN + 30% landmark
-    const blended = Math.round(baseCnnScore * 0.7 + lmScore * 0.3);
-    scores.push(blended);
+    // Blend: 80% CNN + 20% landmark (reduced from 30% to prevent noise amplification)
+    return Math.round(baseCnnScore * 0.8 + lmScore * 0.2);
   }
 
-  // -- Mild age progression: only if base score is already close (>= 30)
-  // Using very mild factor (0.15) to avoid distorting descriptors for different children
-  const blendedBase =
-    scores.length > 1 ? scores[scores.length - 1] : baseCnnScore;
-  if (blendedBase >= 30) {
-    const [mildAged, mildYoung] = await Promise.all([
-      extractAnalysisWithAgeTransform(searchImg, 0.15),
-      extractAnalysisWithAgeTransform(searchImg, -0.15),
-    ]);
-    if (mildAged) {
-      const d = descriptorDistance(
-        mildAged.descriptor,
-        caseAnalysis.descriptor,
-      );
-      scores.push(distanceToScore(d));
-    }
-    if (mildYoung) {
-      const d = descriptorDistance(
-        mildYoung.descriptor,
-        caseAnalysis.descriptor,
-      );
-      scores.push(distanceToScore(d));
-    }
-  }
-
-  return Math.max(...scores);
+  // No landmarks or CNN distance too large -- use CNN score only
+  return baseCnnScore;
 }
 
 export async function computeMatchScore(
@@ -690,6 +654,7 @@ export async function computeMatchScore(
       });
     }
 
+    // Age-progressed preview is for UI display only -- not used in matching
     if (onAgeProgressedDataUrl) {
       const imgData = await loadImageToCanvas(
         searchDataUrl,
@@ -700,23 +665,8 @@ export async function computeMatchScore(
       onAgeProgressedDataUrl(imageDataToDataUrl(aged));
     }
 
-    // Histogram score (always computed -- used for ensemble or fallback)
-    const [searchImageData, caseImageData] = await Promise.all([
-      loadImageToCanvas(searchDataUrl),
-      loadImageToCanvas(casePhotoUrl),
-    ]);
-    const histRaw = histogramIntersection(
-      extractHistogram(searchImageData),
-      extractHistogram(caseImageData),
-    );
-    const _histScore = Math.max(
-      0,
-      Math.min(100, Math.round(((histRaw - 0.3) / 0.5) * 100)),
-    );
-
     if (modelsLoaded) {
       // Load images at full natural size for best detection quality
-      // Also prepare a preprocessed version as backup
       const [searchImgNatural, caseImgNatural] = await Promise.all([
         loadHTMLImageNatural(searchDataUrl),
         loadHTMLImageNatural(casePhotoUrl),
@@ -725,7 +675,6 @@ export async function computeMatchScore(
       const cnnScore = await cnnMatchScore(searchImgNatural, caseImgNatural);
 
       if (cnnScore >= 0) {
-        // Weighted ensemble: CNN+landmark (90%) + histogram (10%)
         return Math.round(cnnScore);
       }
 
@@ -747,29 +696,20 @@ export async function computeMatchScore(
       return 0;
     }
 
-    // Models not loaded -- histogram only with age variants
-    const caseHist = extractHistogram(caseImageData);
-    const histScores = [
-      histogramIntersection(extractHistogram(searchImageData), caseHist),
-      histogramIntersection(
-        extractHistogram(applyAgeProgression(searchImageData, 0.6)),
-        caseHist,
-      ),
-      histogramIntersection(
-        extractHistogram(applyAgeProgression(searchImageData, -0.5)),
-        caseHist,
-      ),
-      histogramIntersection(
-        extractHistogram(searchImageData),
-        extractHistogram(applyAgeProgression(caseImageData, 0.6)),
-      ),
-    ];
-
-    const bestHistRaw = Math.max(...histScores);
+    // Models not loaded -- plain histogram fallback only (no age variants to avoid false positives)
+    const [searchImageData, caseImageData] = await Promise.all([
+      loadImageToCanvas(searchDataUrl),
+      loadImageToCanvas(casePhotoUrl),
+    ]);
+    const histRaw = histogramIntersection(
+      extractHistogram(searchImageData),
+      extractHistogram(caseImageData),
+    );
     const rawScore = Math.max(
       0,
-      Math.min(100, Math.round(((bestHistRaw - 0.3) / 0.5) * 100)),
+      Math.min(100, Math.round(((histRaw - 0.3) / 0.5) * 100)),
     );
+    // Heavily discount histogram-only scores to avoid wrong matches
     return Math.round(rawScore * 0.35);
   } catch {
     return 0;
