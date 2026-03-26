@@ -1,3 +1,12 @@
+// BlazeFace (TensorFlow.js) CDNs -- loaded for better face detection
+const TFJS_CDN =
+  "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js";
+const BLAZEFACE_CDN =
+  "https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@0.0.7/dist/blazeface.min.js";
+
+let blazefaceModel: unknown = null;
+let blazefaceLoading: Promise<void> | null = null;
+
 const CANVAS_SIZE = 64;
 const BINS = 32;
 
@@ -29,6 +38,10 @@ declare global {
   interface Window {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     faceapi: any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    tf: any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    blazeface: any;
   }
 }
 
@@ -100,6 +113,8 @@ export async function ensureModelsLoaded(): Promise<void> {
       if (loaded) {
         modelsLoaded = true;
         modelLoadError = null;
+        // Kick off BlazeFace load in parallel (non-blocking)
+        loadBlazeFace().catch(() => {});
       } else {
         modelLoadError =
           "Could not load face recognition models. Using histogram fallback.";
@@ -120,6 +135,118 @@ export function areModelsLoaded(): boolean {
 
 export function getModelLoadError(): string | null {
   return modelLoadError;
+}
+
+async function loadBlazeFace(): Promise<void> {
+  if (blazefaceModel) return;
+  if (blazefaceLoading) return blazefaceLoading;
+
+  blazefaceLoading = (async () => {
+    try {
+      // Load TF.js if not already loaded
+      if (!window.tf) {
+        await new Promise<void>((resolve, reject) => {
+          const script = document.createElement("script");
+          script.src = TFJS_CDN;
+          script.onload = () => resolve();
+          script.onerror = () => reject(new Error("TF.js load failed"));
+          document.head.appendChild(script);
+        });
+        // Wait for tf global
+        for (let i = 0; i < 20; i++) {
+          if (window.tf) break;
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+
+      // Load BlazeFace
+      if (!window.blazeface) {
+        await new Promise<void>((resolve, reject) => {
+          const script = document.createElement("script");
+          script.src = BLAZEFACE_CDN;
+          script.onload = () => resolve();
+          script.onerror = () => reject(new Error("BlazeFace load failed"));
+          document.head.appendChild(script);
+        });
+        for (let i = 0; i < 20; i++) {
+          if (window.blazeface) break;
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+
+      if (window.blazeface?.load) {
+        blazefaceModel = await window.blazeface.load();
+      }
+    } catch {
+      // BlazeFace is optional -- face-api.js is still the primary detector
+      blazefaceLoading = null;
+    }
+  })();
+
+  return blazefaceLoading;
+}
+
+/**
+ * Use BlazeFace to detect a face bounding box, then crop the image to that
+ * region for better descriptor extraction with face-api.js
+ */
+async function cropFaceWithBlazeFace(
+  imgEl: HTMLImageElement,
+): Promise<HTMLImageElement | null> {
+  try {
+    if (!blazefaceModel) await loadBlazeFace();
+    if (!blazefaceModel) return null;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const model = blazefaceModel as any;
+    const predictions = await model.estimateFaces(imgEl, false);
+
+    if (!predictions || predictions.length === 0) return null;
+
+    // Pick the largest face
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const best = predictions.reduce((prev: any, curr: any) => {
+      const prevArea =
+        (prev.bottomRight[0] - prev.topLeft[0]) *
+        (prev.bottomRight[1] - prev.topLeft[1]);
+      const currArea =
+        (curr.bottomRight[0] - curr.topLeft[0]) *
+        (curr.bottomRight[1] - curr.topLeft[1]);
+      return currArea > prevArea ? curr : prev;
+    });
+
+    // Add 20% padding around the bounding box
+    const x1 = best.topLeft[0] as number;
+    const y1 = best.topLeft[1] as number;
+    const x2 = best.bottomRight[0] as number;
+    const y2 = best.bottomRight[1] as number;
+    const w = x2 - x1;
+    const h = y2 - y1;
+    const pad = 0.2;
+
+    const cropX = Math.max(0, x1 - w * pad);
+    const cropY = Math.max(0, y1 - h * pad);
+    const cropW = Math.min(imgEl.naturalWidth - cropX, w * (1 + 2 * pad));
+    const cropH = Math.min(imgEl.naturalHeight - cropY, h * (1 + 2 * pad));
+
+    if (cropW < 20 || cropH < 20) return null;
+
+    // Draw cropped face at 512x512 for best descriptor quality
+    const canvas = document.createElement("canvas");
+    canvas.width = 512;
+    canvas.height = 512;
+    const ctx = canvas.getContext("2d")!;
+    ctx.drawImage(imgEl, cropX, cropY, cropW, cropH, 0, 0, 512, 512);
+
+    return new Promise<HTMLImageElement>((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = canvas.toDataURL("image/jpeg", 0.95);
+    });
+  } catch {
+    return null;
+  }
 }
 
 export async function loadImageToCanvas(
@@ -434,6 +561,7 @@ interface FaceAnalysis {
  * Try to extract face analysis using all available strategies.
  * Strategies ordered by quality: best resolution first, most permissive last.
  * Uses detectAllFaces for each strategy to catch faces missed by detectSingleFace.
+ * Strategies 8 & 9 use BlazeFace to crop the face region first for higher accuracy.
  */
 async function extractFullFaceAnalysis(
   imgEl: HTMLImageElement,
@@ -535,6 +663,72 @@ async function extractFullFaceAnalysis(
     const result = await strategy();
     if (result) return result;
   }
+
+  // Strategy 8 & 9: BlazeFace crop -- detect face region first, then run face-api.js on crop
+  const cropResult = await cropFaceWithBlazeFace(imgEl);
+  if (cropResult) {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const tryDetectOnCrop = async (
+      options: any,
+    ): Promise<FaceAnalysis | null> => {
+      try {
+        const allDetections = await api
+          .detectAllFaces(cropResult, options)
+          .withFaceLandmarks()
+          .withFaceDescriptors();
+        if (allDetections && allDetections.length > 0) {
+          // eslint-disable-next-line @typescript-eslint/no-explicit-any
+          const best = allDetections.reduce((prev: any, curr: any) => {
+            const prevArea =
+              (prev.detection?.box?.width ?? 0) *
+              (prev.detection?.box?.height ?? 0);
+            const currArea =
+              (curr.detection?.box?.width ?? 0) *
+              (curr.detection?.box?.height ?? 0);
+            return currArea > prevArea ? curr : prev;
+          }, allDetections[0]);
+          if (best?.descriptor) {
+            return {
+              descriptor: best.descriptor,
+              landmarkDesc: best.landmarks
+                ? landmarkGeometryDescriptor(best.landmarks)
+                : null,
+              detection: best.detection,
+            };
+          }
+        }
+        const single = await api
+          .detectSingleFace(cropResult, options)
+          .withFaceLandmarks()
+          .withFaceDescriptor();
+        if (single?.descriptor) {
+          return {
+            descriptor: single.descriptor,
+            landmarkDesc: single.landmarks
+              ? landmarkGeometryDescriptor(single.landmarks)
+              : null,
+            detection: single.detection,
+          };
+        }
+      } catch {
+        // continue
+      }
+      return null;
+    };
+
+    // Strategy 8: BlazeFace crop + SsdMobilenetv1
+    const r8 = await tryDetectOnCrop(
+      new api.SsdMobilenetv1Options({ minConfidence: 0.3 }),
+    );
+    if (r8) return r8;
+
+    // Strategy 9: BlazeFace crop + TinyFaceDetector at 512px
+    const r9 = await tryDetectOnCrop(
+      new api.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.3 }),
+    );
+    if (r9) return r9;
+  }
+
   return null;
 }
 
