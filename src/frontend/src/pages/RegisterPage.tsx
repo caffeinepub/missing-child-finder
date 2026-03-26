@@ -65,10 +65,6 @@ function isCanisterStoppedError(msg: string): boolean {
   );
 }
 
-/**
- * Compress an image data URL to ensure it fits within ICP's ~2MB message limit.
- * Resizes to max 600x600 and encodes as JPEG at reduced quality.
- */
 async function compressImage(dataUrl: string): Promise<string> {
   return new Promise((resolve) => {
     const img = new Image();
@@ -102,11 +98,12 @@ async function compressImage(dataUrl: string): Promise<string> {
 
 export default function RegisterPage() {
   const navigate = useNavigate();
-  const { actor, isFetching: actorLoading } = useActor();
-  const actorError = !actorLoading && false; // actor always loads
-  const refetchActor = () => {
-    window.location.reload();
-  };
+  const {
+    actor,
+    isFetching: actorLoading,
+    isError: actorError,
+    refetch: refetchActor,
+  } = useActor();
   const { identity } = useInternetIdentity();
   const { mutateAsync: registerCase, isPending } = useRegisterCase();
 

@@ -6,33 +6,54 @@ import { getSecretParameter } from "../utils/urlParams";
 import { useInternetIdentity } from "./useInternetIdentity";
 
 const ACTOR_QUERY_KEY = "actor";
+
+async function createActorWithRetry(
+  identity?: unknown,
+  retries = 3,
+): Promise<backendInterface> {
+  let lastError: unknown;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const isAuthenticated = !!identity;
+      const actorOptions = isAuthenticated
+        ? { agentOptions: { identity } }
+        : undefined;
+
+      // @ts-ignore
+      const actor = await createActorWithConfig(actorOptions);
+
+      if (isAuthenticated) {
+        const adminToken = getSecretParameter("caffeineAdminToken") || "";
+        try {
+          await actor._initializeAccessControlWithSecret(adminToken);
+        } catch {
+          // Non-fatal: canister may be restarting. Actor still usable.
+        }
+      }
+
+      return actor;
+    } catch (err) {
+      lastError = err;
+      if (attempt < retries) {
+        await new Promise((resolve) =>
+          setTimeout(resolve, 1000 * (attempt + 1)),
+        );
+      }
+    }
+  }
+  throw lastError;
+}
+
 export function useActor() {
   const { identity } = useInternetIdentity();
   const queryClient = useQueryClient();
+
   const actorQuery = useQuery<backendInterface>({
     queryKey: [ACTOR_QUERY_KEY, identity?.getPrincipal().toString()],
-    queryFn: async () => {
-      const isAuthenticated = !!identity;
-
-      if (!isAuthenticated) {
-        // Return anonymous actor if not authenticated
-        return await createActorWithConfig();
-      }
-
-      const actorOptions = {
-        agentOptions: {
-          identity,
-        },
-      };
-
-      const actor = await createActorWithConfig(actorOptions);
-      const adminToken = getSecretParameter("caffeineAdminToken") || "";
-      await actor._initializeAccessControlWithSecret(adminToken);
-      return actor;
-    },
-    // Only refetch when identity changes
+    queryFn: () => createActorWithRetry(identity),
     staleTime: Number.POSITIVE_INFINITY,
-    // This will cause the actor to be recreated when the identity changes
+    retry: 3,
+    retryDelay: (attempt) => 1000 * (attempt + 1),
     enabled: true,
   });
 
@@ -40,14 +61,10 @@ export function useActor() {
   useEffect(() => {
     if (actorQuery.data) {
       queryClient.invalidateQueries({
-        predicate: (query) => {
-          return !query.queryKey.includes(ACTOR_QUERY_KEY);
-        },
+        predicate: (query) => !query.queryKey.includes(ACTOR_QUERY_KEY),
       });
       queryClient.refetchQueries({
-        predicate: (query) => {
-          return !query.queryKey.includes(ACTOR_QUERY_KEY);
-        },
+        predicate: (query) => !query.queryKey.includes(ACTOR_QUERY_KEY),
       });
     }
   }, [actorQuery.data, queryClient]);
@@ -55,5 +72,7 @@ export function useActor() {
   return {
     actor: actorQuery.data || null,
     isFetching: actorQuery.isFetching,
+    isError: actorQuery.isError,
+    refetch: actorQuery.refetch,
   };
 }
