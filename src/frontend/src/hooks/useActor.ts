@@ -15,7 +15,6 @@ export function useActor() {
       const isAuthenticated = !!identity;
 
       if (!isAuthenticated) {
-        // Return anonymous actor if not authenticated
         return await createActorWithConfig();
       }
 
@@ -26,25 +25,19 @@ export function useActor() {
       };
 
       const actor = await createActorWithConfig(actorOptions);
-      // Wrap in try-catch so a restarting canister doesn't block actor creation
+      const adminToken = getSecretParameter("caffeineAdminToken") || "";
       try {
-        const adminToken = getSecretParameter("caffeineAdminToken") || "";
         await actor._initializeAccessControlWithSecret(adminToken);
-      } catch (_initErr) {
-        // Ignore init errors — the actor is still usable for normal calls
-        console.warn(
-          "[useActor] _initializeAccessControlWithSecret failed (canister may be restarting):",
-          _initErr,
-        );
+      } catch (e) {
+        // Canister may be restarting; actor is still usable for other calls
+        console.warn("_initializeAccessControlWithSecret failed:", e);
       }
       return actor;
     },
-    // Retry up to 3 times with backoff on failure
-    retry: 3,
-    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 8000),
-    // Only refetch when identity changes
     staleTime: Number.POSITIVE_INFINITY,
     enabled: true,
+    retry: 3,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 8000),
   });
 
   // When the actor changes, invalidate dependent queries
@@ -63,10 +56,12 @@ export function useActor() {
     }
   }, [actorQuery.data, queryClient]);
 
+  const refetch = () => actorQuery.refetch();
+
   return {
     actor: actorQuery.data || null,
     isFetching: actorQuery.isFetching,
     isError: actorQuery.isError,
-    refetch: actorQuery.refetch,
+    refetch,
   };
 }
