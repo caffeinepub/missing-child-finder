@@ -1,10 +1,9 @@
 // ═══════════════════════════════════════════════════════════════════════════
-// Missing Child Finder – Face Analysis Engine
-// Models: face-api.js (CNN) · BlazeFace (TF.js) · ResNet50 (TF.js) ·
-//         YOLOv8-ONNX (onnxruntime-web) · Age Progression
+// Missing Child Finder – Face Analysis Engine  v2
+// Models: face-api.js (CNN) · BlazeFace · YOLOv8-ONNX · Age Progression
+// ResNet50 is best-effort only (TFHub CORS often blocked in browser)
 // ═══════════════════════════════════════════════════════════════════════════
 
-// ─── CDN versions ────────────────────────────────────────────────────────────
 const TFJS_VERSION = "4.22.0";
 const BLAZEFACE_VERSION = "0.0.7";
 const ORT_VERSION = "1.18.0";
@@ -13,7 +12,6 @@ const TFJS_CDN = `https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@${TFJS_VERSION}/
 const BLAZEFACE_CDN = `https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@${BLAZEFACE_VERSION}/dist/blazeface.min.js`;
 const ORT_CDN = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/ort.min.js`;
 
-// face-api.js CDN list (tried in order, first available wins)
 const FACEAPI_CDNS = [
   "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.js",
   "https://unpkg.com/@vladmandic/face-api@1.7.13/dist/face-api.js",
@@ -23,7 +21,6 @@ const FACEAPI_CDNS = [
   "https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js",
 ];
 
-// face-api model weight CDNs
 const MODEL_URLS = [
   "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model",
   "https://unpkg.com/@vladmandic/face-api/model",
@@ -33,13 +30,6 @@ const MODEL_URLS = [
   "https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights",
 ];
 
-// ResNet50 feature vector model (TF.js SavedModel format on TFHub)
-const RESNET50_TFJS_URLS = [
-  "https://tfhub.dev/google/tfjs-model/imagenet/resnet_v2_50/feature_vector/1/default/1",
-  "https://storage.googleapis.com/tfjs-models/savedmodel/resnet50_imagenet/model.json",
-];
-
-// YOLOv8-nano face detection ONNX model
 const YOLOV8_ONNX_URLS = [
   "https://huggingface.co/spaces/nicehorse/yolov8-face-detection/resolve/main/yolov8n-face.onnx",
   "https://raw.githubusercontent.com/akanametov/yolo-face/main/weights/yolov8n-face.onnx",
@@ -48,8 +38,16 @@ const YOLOV8_ONNX_URLS = [
 const CANVAS_SIZE = 64;
 const BINS = 32;
 
-/** CNN distance below this = genuine face match (same person in different lighting: 0.30–0.65) */
-const CNN_MATCH_THRESHOLD = 0.72;
+/**
+ * CNN Euclidean distance thresholds (face-api.js 128-dim FaceNet descriptor):
+ *   Same person, good photo: 0.20 – 0.50
+ *   Same person, different lighting/angle: 0.40 – 0.65
+ *   Different people: usually > 0.60, almost always > 0.70
+ *
+ * We use 0.75 as the max threshold — anything below returns a score,
+ * anything above returns 0 (not a match).
+ */
+const CNN_THRESHOLD = 0.75;
 
 // ─── Global model state ───────────────────────────────────────────────────────
 let faceApiLoaded = false;
@@ -58,10 +56,6 @@ let faceApiLoading: Promise<void> | null = null;
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let blazefaceModel: any = null;
 let blazefaceLoading: Promise<void> | null = null;
-
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-let resnet50Model: any = null;
-let resnet50Loading: Promise<void> | null = null;
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 let yolov8Session: any = null;
@@ -88,7 +82,7 @@ function getFaceApi(): any {
 }
 
 // ─── Script loader ────────────────────────────────────────────────────────────
-function loadScript(src: string): Promise<void> {
+function loadScript(src: string, timeoutMs = 10000): Promise<void> {
   return new Promise((resolve, reject) => {
     if (document.querySelector(`script[src="${src}"]`)) {
       resolve();
@@ -96,8 +90,18 @@ function loadScript(src: string): Promise<void> {
     }
     const s = document.createElement("script");
     s.src = src;
-    s.onload = () => resolve();
-    s.onerror = () => reject(new Error(`Failed to load: ${src}`));
+    const timer = setTimeout(
+      () => reject(new Error(`Timeout: ${src}`)),
+      timeoutMs,
+    );
+    s.onload = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    s.onerror = () => {
+      clearTimeout(timer);
+      reject(new Error(`Failed: ${src}`));
+    };
     document.head.appendChild(s);
   });
 }
@@ -109,13 +113,14 @@ async function loadScriptWithFallback(
   for (const cdn of cdns) {
     try {
       await loadScript(cdn);
+      // Poll up to 2 seconds for the global to appear
       for (let i = 0; i < 20; i++) {
         if (checkFn()) return;
         await new Promise((r) => setTimeout(r, 100));
       }
       if (checkFn()) return;
     } catch {
-      /* try next */
+      /* try next CDN */
     }
   }
   throw new Error(`All CDNs failed: ${cdns[0]}`);
@@ -146,7 +151,7 @@ async function initFaceApi(): Promise<void> {
   throw new Error("All face-api model CDNs failed");
 }
 
-// ─── 2. BlazeFace loader (TensorFlow.js) ─────────────────────────────────────
+// ─── 2. BlazeFace loader ──────────────────────────────────────────────────────
 async function initBlazeFace(): Promise<void> {
   if (blazefaceModel) return;
   if (blazefaceLoading) return blazefaceLoading;
@@ -174,43 +179,7 @@ async function initBlazeFace(): Promise<void> {
   return blazefaceLoading;
 }
 
-// ─── 3. ResNet50 loader (TensorFlow.js graph model) ──────────────────────────
-async function initResNet50(): Promise<void> {
-  if (resnet50Model) return;
-  if (resnet50Loading) return resnet50Loading;
-  resnet50Loading = (async () => {
-    try {
-      if (!window.tf) {
-        await loadScript(TFJS_CDN);
-        for (let i = 0; i < 20; i++) {
-          if (window.tf) break;
-          await new Promise((r) => setTimeout(r, 100));
-        }
-      }
-      const tf = window.tf;
-      if (!tf) {
-        resnet50Loading = null;
-        return;
-      }
-      for (const url of RESNET50_TFJS_URLS) {
-        try {
-          resnet50Model = await tf.loadGraphModel(url, {
-            fromTFHub: url.includes("tfhub.dev"),
-          });
-          if (resnet50Model) return;
-        } catch {
-          /* try next */
-        }
-      }
-      resnet50Loading = null;
-    } catch {
-      resnet50Loading = null;
-    }
-  })();
-  return resnet50Loading;
-}
-
-// ─── 4. YOLOv8-ONNX loader (onnxruntime-web) ─────────────────────────────────
+// ─── 3. YOLOv8-ONNX loader ───────────────────────────────────────────────────
 async function initYolov8(): Promise<void> {
   if (yolov8Session) return;
   if (yolov8Loading) return yolov8Loading;
@@ -259,10 +228,9 @@ export async function ensureModelsLoaded(): Promise<void> {
       await initFaceApi();
       faceApiLoaded = true;
       modelLoadError = null;
-      // Load the remaining three models non-blocking in parallel
+      // Load optional models non-blocking
       Promise.all([
         initBlazeFace().catch(() => {}),
-        initResNet50().catch(() => {}),
         initYolov8().catch(() => {}),
       ]);
     } catch (e) {
@@ -314,33 +282,47 @@ function loadHTMLImage(src: string): Promise<HTMLImageElement> {
   });
 }
 
-export async function preprocessImageForFace(
+/**
+ * Resize an image to targetSize × targetSize and apply contrast normalisation.
+ * Returns the preprocessed HTMLImageElement.
+ */
+async function preprocessImage(
   src: string,
-  targetSize = 320,
+  targetSize: number,
 ): Promise<HTMLImageElement> {
   const imageData = await loadImageToCanvas(src, targetSize, targetSize);
   const data = imageData.data;
-  const gray: number[] = [];
-  for (let i = 0; i < data.length; i += 4)
-    gray.push(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
-  gray.sort((a, b) => a - b);
-  const p2 = gray[Math.floor(gray.length * 0.02)] ?? 0;
-  const p98 = gray[Math.floor(gray.length * 0.98)] ?? 255;
-  const range = Math.max(p98 - p2, 1);
+
+  // Compute per-channel mean for normalisation
+  let sumR = 0;
+  let sumG = 0;
+  let sumB = 0;
+  const n = imageData.width * imageData.height;
+  for (let i = 0; i < data.length; i += 4) {
+    sumR += data[i];
+    sumG += data[i + 1];
+    sumB += data[i + 2];
+  }
+  const meanR = sumR / n;
+  const meanG = sumG / n;
+  const meanB = sumB / n;
+
+  // Mild contrast stretch
   for (let i = 0; i < data.length; i += 4) {
     data[i] = Math.min(
       255,
-      Math.max(0, Math.round(((data[i] - p2) / range) * 255)),
+      Math.max(0, Math.round((data[i] - meanR) * 1.1 + 128)),
     );
     data[i + 1] = Math.min(
       255,
-      Math.max(0, Math.round(((data[i + 1] - p2) / range) * 255)),
+      Math.max(0, Math.round((data[i + 1] - meanG) * 1.1 + 128)),
     );
     data[i + 2] = Math.min(
       255,
-      Math.max(0, Math.round(((data[i + 2] - p2) / range) * 255)),
+      Math.max(0, Math.round((data[i + 2] - meanB) * 1.1 + 128)),
     );
   }
+
   const canvas = document.createElement("canvas");
   canvas.width = targetSize;
   canvas.height = targetSize;
@@ -371,12 +353,10 @@ export function histogramIntersection(h1: number[], h2: number[]): number {
   return sum > 0 ? intersection / sum : 0;
 }
 
-// ─── 5. Age Progression ───────────────────────────────────────────────────────
+// ─── Age Progression ─────────────────────────────────────────────────────────
 /**
- * Apply age progression / de-aging to an ImageData.
- * ageFactor > 0 = age forward (child is older now than in registered photo)
- * ageFactor < 0 = de-age (child is younger now)
- * ageFactor = 0 = no change
+ * Lightweight pixel-level age simulation applied to a registered (case) photo.
+ * ageFactor > 0 = age forward · ageFactor < 0 = de-age
  */
 export function applyAgeProgression(
   imageData: ImageData,
@@ -389,35 +369,32 @@ export function applyAgeProgression(
   );
   const d = out.data;
   if (ageFactor > 0) {
-    // Forward aging: warm skin tone shift, slight texture contrast boost
-    const rBoost = ageFactor * 20;
-    const gDrop = ageFactor * 7;
+    const rBoost = ageFactor * 18;
+    const gDrop = ageFactor * 6;
     for (let i = 0; i < d.length; i += 4) {
       d[i] = Math.min(255, d[i] + rBoost);
       d[i + 1] = Math.min(255, Math.max(0, d[i + 1] - gDrop));
-      // Contrast bump
-      d[i] = Math.round(Math.min(255, Math.max(0, (d[i] - 128) * 1.05 + 128)));
+      d[i] = Math.round(Math.min(255, Math.max(0, (d[i] - 128) * 1.04 + 128)));
       d[i + 1] = Math.round(
-        Math.min(255, Math.max(0, (d[i + 1] - 128) * 1.05 + 128)),
+        Math.min(255, Math.max(0, (d[i + 1] - 128) * 1.04 + 128)),
       );
       d[i + 2] = Math.round(
-        Math.min(255, Math.max(0, (d[i + 2] - 128) * 1.05 + 128)),
+        Math.min(255, Math.max(0, (d[i + 2] - 128) * 1.04 + 128)),
       );
     }
   } else if (ageFactor < 0) {
-    // De-aging: cooler tone, reduced contrast
     const f = Math.abs(ageFactor);
-    const bBoost = f * 12;
-    const rDrop = f * 8;
+    const bBoost = f * 10;
+    const rDrop = f * 7;
     for (let i = 0; i < d.length; i += 4) {
       d[i] = Math.min(255, Math.max(0, d[i] - rDrop));
       d[i + 2] = Math.min(255, d[i + 2] + bBoost);
-      d[i] = Math.round(Math.min(255, Math.max(0, (d[i] - 128) * 0.96 + 128)));
+      d[i] = Math.round(Math.min(255, Math.max(0, (d[i] - 128) * 0.97 + 128)));
       d[i + 1] = Math.round(
-        Math.min(255, Math.max(0, (d[i + 1] - 128) * 0.96 + 128)),
+        Math.min(255, Math.max(0, (d[i + 1] - 128) * 0.97 + 128)),
       );
       d[i + 2] = Math.round(
-        Math.min(255, Math.max(0, (d[i + 2] - 128) * 0.96 + 128)),
+        Math.min(255, Math.max(0, (d[i + 2] - 128) * 0.97 + 128)),
       );
     }
   }
@@ -432,7 +409,7 @@ function imageDataToDataUrl(id: ImageData): string {
   return c.toDataURL("image/jpeg", 0.9);
 }
 
-// ─── YOLOv8 face detection ────────────────────────────────────────────────────
+// ─── YOLOv8 face crop ────────────────────────────────────────────────────────
 interface FaceBox {
   x: number;
   y: number;
@@ -441,67 +418,51 @@ interface FaceBox {
   conf: number;
 }
 
-/**
- * Run YOLOv8 ONNX face detection on an image element.
- * Returns the best (largest) bounding box found, or null.
- */
 async function detectFaceYolov8(
   imgEl: HTMLImageElement,
 ): Promise<FaceBox | null> {
   if (!yolov8Session) return null;
   try {
-    const tf = window.tf;
     const ort = window.ort;
-    if (!tf || !ort) return null;
-
+    if (!ort) return null;
     const INPUT_SIZE = 640;
     const canvas = document.createElement("canvas");
     canvas.width = INPUT_SIZE;
     canvas.height = INPUT_SIZE;
     canvas.getContext("2d")!.drawImage(imgEl, 0, 0, INPUT_SIZE, INPUT_SIZE);
-
-    // Build Float32 tensor [1, 3, 640, 640] normalised to [0, 1]
     const imageData = canvas
       .getContext("2d")!
       .getImageData(0, 0, INPUT_SIZE, INPUT_SIZE);
-    const inputArray = new Float32Array(1 * 3 * INPUT_SIZE * INPUT_SIZE);
+    const inputArray = new Float32Array(3 * INPUT_SIZE * INPUT_SIZE);
     for (let y = 0; y < INPUT_SIZE; y++) {
       for (let x = 0; x < INPUT_SIZE; x++) {
         const idx = (y * INPUT_SIZE + x) * 4;
         const pixel = y * INPUT_SIZE + x;
-        inputArray[pixel] = imageData.data[idx] / 255; // R
+        inputArray[pixel] = imageData.data[idx] / 255;
         inputArray[INPUT_SIZE * INPUT_SIZE + pixel] =
-          imageData.data[idx + 1] / 255; // G
+          imageData.data[idx + 1] / 255;
         inputArray[2 * INPUT_SIZE * INPUT_SIZE + pixel] =
-          imageData.data[idx + 2] / 255; // B
+          imageData.data[idx + 2] / 255;
       }
     }
-
-    const inputTensor = new ort.Tensor("float32", inputArray, [
+    const tensor = new ort.Tensor("float32", inputArray, [
       1,
       3,
       INPUT_SIZE,
       INPUT_SIZE,
     ]);
     const feeds: Record<string, unknown> = {};
-    feeds[yolov8Session.inputNames[0]] = inputTensor;
+    feeds[yolov8Session.inputNames[0]] = tensor;
     const results = await yolov8Session.run(feeds);
     const output = results[yolov8Session.outputNames[0]];
     if (!output) return null;
-
-    // YOLOv8 output: [1, 5, num_anchors] (x, y, w, h, conf) or [1, num_anchors, 5]
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const data = output.data as Float32Array;
     const dims = output.dims as number[];
-
-    let bestBox: FaceBox | null = null;
-    const scaleX = imgEl.naturalWidth / INPUT_SIZE;
-    const scaleY = imgEl.naturalHeight / INPUT_SIZE;
-
-    // Handle both [1, 5, N] and [1, N, 5] layouts
     const isChannelFirst = dims[1] === 5;
     const numDetections = isChannelFirst ? dims[2] : dims[1];
-
+    const scaleX = imgEl.naturalWidth / INPUT_SIZE;
+    const scaleY = imgEl.naturalHeight / INPUT_SIZE;
+    let bestBox: FaceBox | null = null;
     for (let i = 0; i < numDetections; i++) {
       let cx: number;
       let cy: number;
@@ -515,13 +476,13 @@ async function detectFaceYolov8(
         h = data[3 * numDetections + i];
         conf = data[4 * numDetections + i];
       } else {
-        cx = data[i * 5 + 0];
+        cx = data[i * 5];
         cy = data[i * 5 + 1];
         w = data[i * 5 + 2];
         h = data[i * 5 + 3];
         conf = data[i * 5 + 4];
       }
-      if (conf < 0.4) continue;
+      if (conf < 0.35) continue;
       const box: FaceBox = {
         x: (cx - w / 2) * scaleX,
         y: (cy - h / 2) * scaleY,
@@ -537,11 +498,32 @@ async function detectFaceYolov8(
   }
 }
 
+async function cropFaceYolov8(
+  imgEl: HTMLImageElement,
+): Promise<HTMLImageElement | null> {
+  const box = await detectFaceYolov8(imgEl);
+  if (!box) return null;
+  try {
+    const pad = 0.25;
+    const cx = Math.max(0, box.x - box.w * pad);
+    const cy = Math.max(0, box.y - box.h * pad);
+    const cw = Math.min(imgEl.naturalWidth - cx, box.w * (1 + 2 * pad));
+    const ch = Math.min(imgEl.naturalHeight - cy, box.h * (1 + 2 * pad));
+    if (cw < 20 || ch < 20) return null;
+    const canvas = document.createElement("canvas");
+    canvas.width = 512;
+    canvas.height = 512;
+    canvas.getContext("2d")!.drawImage(imgEl, cx, cy, cw, ch, 0, 0, 512, 512);
+    return loadHTMLImage(canvas.toDataURL("image/jpeg", 0.95));
+  } catch {
+    return null;
+  }
+}
+
 // ─── BlazeFace face crop ──────────────────────────────────────────────────────
 async function cropFaceBlazeFace(
   imgEl: HTMLImageElement,
 ): Promise<HTMLImageElement | null> {
-  if (!blazefaceModel) await initBlazeFace();
   if (!blazefaceModel) return null;
   try {
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -560,7 +542,7 @@ async function cropFaceBlazeFace(
     const y2 = best.bottomRight[1] as number;
     const w = x2 - x1;
     const h = y2 - y1;
-    const pad = 0.25;
+    const pad = 0.3;
     const cx = Math.max(0, x1 - w * pad);
     const cy = Math.max(0, y1 - h * pad);
     const cw = Math.min(imgEl.naturalWidth - cx, w * (1 + 2 * pad));
@@ -576,79 +558,7 @@ async function cropFaceBlazeFace(
   }
 }
 
-// ─── YOLOv8 face crop ────────────────────────────────────────────────────────
-async function cropFaceYolov8(
-  imgEl: HTMLImageElement,
-): Promise<HTMLImageElement | null> {
-  if (!yolov8Session) await initYolov8();
-  const box = await detectFaceYolov8(imgEl);
-  if (!box) return null;
-  try {
-    const pad = 0.2;
-    const cx = Math.max(0, box.x - box.w * pad);
-    const cy = Math.max(0, box.y - box.h * pad);
-    const cw = Math.min(imgEl.naturalWidth - cx, box.w * (1 + 2 * pad));
-    const ch = Math.min(imgEl.naturalHeight - cy, box.h * (1 + 2 * pad));
-    if (cw < 20 || ch < 20) return null;
-    const canvas = document.createElement("canvas");
-    canvas.width = 512;
-    canvas.height = 512;
-    canvas.getContext("2d")!.drawImage(imgEl, cx, cy, cw, ch, 0, 0, 512, 512);
-    return loadHTMLImage(canvas.toDataURL("image/jpeg", 0.95));
-  } catch {
-    return null;
-  }
-}
-
-// ─── ResNet50 feature extraction ──────────────────────────────────────────────
-async function extractResNet50Embedding(
-  imgEl: HTMLImageElement,
-): Promise<Float32Array | null> {
-  if (!resnet50Model) await initResNet50();
-  if (!resnet50Model) return null;
-  try {
-    const tf = window.tf;
-    if (!tf) return null;
-    const embedding = tf.tidy(() => {
-      const raw = tf.browser.fromPixels(imgEl);
-      const resized = tf.image.resizeBilinear(raw, [224, 224]);
-      const norm = resized
-        .toFloat()
-        .div(255.0)
-        .sub([0.485, 0.456, 0.406])
-        .div([0.229, 0.224, 0.225]);
-      const batched = norm.expandDims(0);
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      const output = (resnet50Model as any).predict
-        ? (resnet50Model as any).predict(batched)
-        : (resnet50Model as any).execute(batched);
-      // Flatten & global average pool if needed
-      if (output.shape.length === 4) return output.mean([1, 2]).squeeze();
-      return output.squeeze();
-    });
-    const data = (await embedding.data()) as Float32Array;
-    embedding.dispose();
-    return data;
-  } catch {
-    return null;
-  }
-}
-
-function cosineDistance(a: Float32Array, b: Float32Array): number {
-  if (a.length !== b.length) return 1;
-  let dot = 0;
-  let nA = 0;
-  let nB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    nA += a[i] * a[i];
-    nB += b[i] * b[i];
-  }
-  const denom = Math.sqrt(nA) * Math.sqrt(nB);
-  return denom === 0 ? 1 : 1 - dot / denom;
-}
-
-// ─── face-api.js landmark geometry ───────────────────────────────────────────
+// ─── Landmark geometry ────────────────────────────────────────────────────────
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
 function landmarkGeometryDescriptor(landmarks: any): Float32Array | null {
   try {
@@ -699,7 +609,25 @@ function descriptorDistance(a: Float32Array, b: Float32Array): number {
   return Math.sqrt(sum);
 }
 
-// ─── face-api.js full analysis ────────────────────────────────────────────────
+// ─── Distance → score mapping ─────────────────────────────────────────────────
+/**
+ * Maps a Euclidean CNN descriptor distance [0..2] to a 0-100 score.
+ * Distances above CNN_THRESHOLD (0.75) yield 0 (no confident match).
+ */
+function cnnDistanceToScore(distance: number): number {
+  if (distance <= 0.2) return 100;
+  if (distance <= 0.3) return Math.round(90 + ((0.3 - distance) / 0.1) * 10);
+  if (distance <= 0.45) return Math.round(75 + ((0.45 - distance) / 0.15) * 15);
+  if (distance <= 0.55) return Math.round(65 + ((0.55 - distance) / 0.1) * 10);
+  if (distance <= 0.65) return Math.round(55 + ((0.65 - distance) / 0.1) * 10);
+  if (distance <= CNN_THRESHOLD)
+    return Math.round(
+      40 + ((CNN_THRESHOLD - distance) / (CNN_THRESHOLD - 0.65)) * 15,
+    );
+  return 0; // different person
+}
+
+// ─── face-api.js analysis ────────────────────────────────────────────────────
 interface FaceAnalysis {
   descriptor: Float32Array;
   landmarkDesc: Float32Array | null;
@@ -707,7 +635,12 @@ interface FaceAnalysis {
   detection: any;
 }
 
-async function extractFaceApiAnalysis(
+/**
+ * Try to extract a face descriptor from imgEl using face-api.js.
+ * Tries multiple detection strategies in order of permissiveness.
+ * Returns null only if no face can be found at all.
+ */
+async function extractFaceAnalysis(
   imgEl: HTMLImageElement,
 ): Promise<FaceAnalysis | null> {
   const api = getFaceApi();
@@ -720,6 +653,7 @@ async function extractFaceApiAnalysis(
   ): Promise<FaceAnalysis | null> => {
     const img = src ?? imgEl;
     try {
+      // Try detectAllFaces first (more robust)
       const all = await api
         .detectAllFaces(img, opts)
         .withFaceLandmarks()
@@ -734,7 +668,7 @@ async function extractFaceApiAnalysis(
               : p,
           all[0],
         );
-        if (best?.descriptor)
+        if (best?.descriptor) {
           return {
             descriptor: best.descriptor,
             landmarkDesc: best.landmarks
@@ -742,16 +676,18 @@ async function extractFaceApiAnalysis(
               : null,
             detection: best.detection,
           };
+        }
       }
     } catch {
       /* fall through */
     }
+    // Fallback: detectSingleFace
     try {
       const single = await api
-        .detectSingleFace(imgEl, opts)
+        .detectSingleFace(img, opts)
         .withFaceLandmarks()
         .withFaceDescriptor();
-      if (single?.descriptor)
+      if (single?.descriptor) {
         return {
           descriptor: single.descriptor,
           landmarkDesc: single.landmarks
@@ -759,13 +695,14 @@ async function extractFaceApiAnalysis(
             : null,
           detection: single.detection,
         };
+      }
     } catch {
       /* fall through */
     }
     return null;
   };
 
-  // Detection strategies using face-api.js
+  // Ordered strategies: progressively more permissive
   const strategies = [
     () => tryDetect(new api.SsdMobilenetv1Options({ minConfidence: 0.5 })),
     () =>
@@ -775,23 +712,30 @@ async function extractFaceApiAnalysis(
           scoreThreshold: 0.4,
         }),
       ),
-    () => tryDetect(new api.SsdMobilenetv1Options({ minConfidence: 0.3 })),
+    () => tryDetect(new api.SsdMobilenetv1Options({ minConfidence: 0.35 })),
     () =>
       tryDetect(
         new api.TinyFaceDetectorOptions({
           inputSize: 416,
-          scoreThreshold: 0.35,
+          scoreThreshold: 0.3,
         }),
       ),
-    () => tryDetect(new api.SsdMobilenetv1Options({ minConfidence: 0.15 })),
+    () => tryDetect(new api.SsdMobilenetv1Options({ minConfidence: 0.2 })),
     () =>
       tryDetect(
         new api.TinyFaceDetectorOptions({
           inputSize: 608,
-          scoreThreshold: 0.25,
+          scoreThreshold: 0.2,
         }),
       ),
-    () => tryDetect(new api.SsdMobilenetv1Options({ minConfidence: 0.05 })),
+    () => tryDetect(new api.SsdMobilenetv1Options({ minConfidence: 0.08 })),
+    () =>
+      tryDetect(
+        new api.TinyFaceDetectorOptions({
+          inputSize: 320,
+          scoreThreshold: 0.1,
+        }),
+      ),
   ];
 
   for (const s of strategies) {
@@ -799,24 +743,24 @@ async function extractFaceApiAnalysis(
     if (r) return r;
   }
 
-  // BlazeFace crop → face-api.js
+  // Try BlazeFace crop → face-api.js
   const blazeCrop = await cropFaceBlazeFace(imgEl);
   if (blazeCrop) {
     for (const opts of [
       new api.SsdMobilenetv1Options({ minConfidence: 0.3 }),
-      new api.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.3 }),
+      new api.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.25 }),
     ]) {
       const r = await tryDetect(opts, blazeCrop);
       if (r) return r;
     }
   }
 
-  // YOLOv8 crop → face-api.js
+  // Try YOLOv8 crop → face-api.js
   const yoloCrop = await cropFaceYolov8(imgEl);
   if (yoloCrop) {
     for (const opts of [
       new api.SsdMobilenetv1Options({ minConfidence: 0.3 }),
-      new api.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.3 }),
+      new api.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.25 }),
     ]) {
       const r = await tryDetect(opts, yoloCrop);
       if (r) return r;
@@ -826,191 +770,173 @@ async function extractFaceApiAnalysis(
   return null;
 }
 
+// ─── Whole-image CNN fallback ─────────────────────────────────────────────────
+/**
+ * When face detection fails, run faceRecognitionNet directly on the
+ * whole resized image. Returns the descriptor or null.
+ */
+async function wholeImageDescriptor(
+  imgEl: HTMLImageElement,
+): Promise<Float32Array | null> {
+  const api = getFaceApi();
+  if (!api) return null;
+  try {
+    const canvas = document.createElement("canvas");
+    canvas.width = 224;
+    canvas.height = 224;
+    canvas.getContext("2d")!.drawImage(imgEl, 0, 0, 224, 224);
+    const raw = await api.nets.faceRecognitionNet.computeFaceDescriptor(canvas);
+    if (!raw) return null;
+    return raw instanceof Float32Array ? raw : new Float32Array(raw);
+  } catch {
+    return null;
+  }
+}
+
+// ─── Core pair comparison ─────────────────────────────────────────────────────
+/**
+ * Compare searchImg vs caseImg using all available signals.
+ * Always returns a score in [0, 100].
+ *   score >= 65 → high confidence match
+ *   score >= 40 → possible match
+ *   score >= 1  → low similarity
+ *   score == 0  → no facial similarity / no face detected
+ */
+async function compareFacePair(
+  searchImg: HTMLImageElement,
+  caseImg: HTMLImageElement,
+): Promise<number> {
+  const [searchFA, caseFA] = await Promise.all([
+    extractFaceAnalysis(searchImg),
+    extractFaceAnalysis(caseImg),
+  ]);
+
+  // ── Both face detections succeeded ─────────────────────────────────────────
+  if (searchFA && caseFA) {
+    const cnnDist = descriptorDistance(searchFA.descriptor, caseFA.descriptor);
+    let score = cnnDistanceToScore(cnnDist);
+
+    // If score is 0 (different people), return immediately — don't let
+    // landmark scoring inflate it.
+    if (score === 0) return 0;
+
+    // ── Landmark geometry (20% weight when CNN already passes) ───────────────
+    if (searchFA.landmarkDesc && caseFA.landmarkDesc) {
+      const lmDist = landmarkDistance(
+        searchFA.landmarkDesc,
+        caseFA.landmarkDesc,
+      );
+      const lmScore =
+        lmDist <= 0.04
+          ? 95
+          : lmDist <= 0.07
+            ? Math.round(80 + ((0.07 - lmDist) / 0.03) * 15)
+            : lmDist <= 0.12
+              ? Math.round(55 + ((0.12 - lmDist) / 0.05) * 25)
+              : lmDist <= 0.2
+                ? Math.round(25 + ((0.2 - lmDist) / 0.08) * 30)
+                : Math.max(0, Math.round(25 - ((lmDist - 0.2) / 0.2) * 25));
+      // 80% CNN + 20% landmark
+      score = Math.round(score * 0.8 + lmScore * 0.2);
+    }
+
+    return Math.max(0, Math.min(100, score));
+  }
+
+  // ── At least one face detection failed — whole-image CNN fallback ───────────
+  try {
+    const [dA, dB] = await Promise.all([
+      searchFA
+        ? Promise.resolve(searchFA.descriptor)
+        : wholeImageDescriptor(searchImg),
+      caseFA
+        ? Promise.resolve(caseFA.descriptor)
+        : wholeImageDescriptor(caseImg),
+    ]);
+    if (dA && dB) {
+      const dist = descriptorDistance(dA, dB);
+      // Whole-image CNN is less reliable so cap at 55 even for close distances
+      const raw = cnnDistanceToScore(dist);
+      return Math.min(55, raw);
+    }
+  } catch {
+    /* ignore */
+  }
+
+  return 0;
+}
+
 export async function detectFaceInImage(
   imgEl: HTMLImageElement,
 ): Promise<boolean> {
   const api = getFaceApi();
   if (!api) return false;
   try {
+    const d = await api.detectSingleFace(
+      imgEl,
+      new api.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.3 }),
+    );
+    if (d) return true;
     const all = await api
       .detectAllFaces(
         imgEl,
-        new api.TinyFaceDetectorOptions({
-          inputSize: 416,
-          scoreThreshold: 0.3,
-        }),
+        new api.SsdMobilenetv1Options({ minConfidence: 0.2 }),
       )
       .run();
-    if (all && all.length > 0) return true;
-    const d = await api.detectSingleFace(
-      imgEl,
-      new api.SsdMobilenetv1Options({ minConfidence: 0.2 }),
-    );
-    return !!d;
+    return !!(all && all.length > 0);
   } catch {
     return false;
   }
 }
 
-// ─── Score conversion ─────────────────────────────────────────────────────────
-function distanceToScore(distance: number, cap55 = false): number {
-  if (distance <= 0.2) return cap55 ? 55 : 100;
-  if (distance <= 0.3)
-    return cap55 ? 55 : Math.round(90 + ((0.3 - distance) / 0.1) * 10);
-  if (distance <= 0.45)
-    return cap55 ? 55 : Math.round(75 + ((0.45 - distance) / 0.15) * 15);
-  if (distance <= 0.55)
-    return cap55 ? 55 : Math.round(65 + ((0.55 - distance) / 0.1) * 10);
-  if (distance <= 0.65)
-    return cap55 ? 55 : Math.round(58 + ((0.65 - distance) / 0.1) * 7);
-  if (distance <= CNN_MATCH_THRESHOLD)
-    return Math.round(
-      50 +
-        ((CNN_MATCH_THRESHOLD - distance) / (CNN_MATCH_THRESHOLD - 0.65)) * 8,
-    );
-  return 0;
-}
-
-// ─── Core match engine ────────────────────────────────────────────────────────
+// ─── Age progression wrapper ──────────────────────────────────────────────────
 /**
- * Signal pipeline (all 5 models):
- * 1. face-api.js CNN (128-dim) — primary identity descriptor
- * 2. face-api.js 68-point landmark geometry — structural face shape
- * 3. ResNet50 (TF.js, 2048-dim) — deep visual identity signal
- * 4. Age Progression — registered photo aged ±N before comparison
- * 5. BlazeFace + YOLOv8-ONNX — used for face crop to improve all above signals
- *
- * Final weight: 55% CNN · 20% landmark · 25% ResNet50
- * Only matches with CNN distance < 0.72 are returned; returns -1 otherwise.
+ * Run compareFacePair across 5 age-progression variants of the case photo.
+ * Returns the BEST score found across all variants.
+ * Age factors: 0 (original), +0.4, +0.8, +1.2, -0.4 (de-aged)
  */
-async function cnnMatchScore(
+async function compareWithAgeProgression(
   searchImg: HTMLImageElement,
-  caseImg: HTMLImageElement,
-): Promise<number> {
-  const [searchFA, caseFA] = await Promise.all([
-    extractFaceApiAnalysis(searchImg),
-    extractFaceApiAnalysis(caseImg),
-  ]);
-
-  // ── Whole-image CNN fallback when face detection fails ─────────────────────
-  if (!searchFA || !caseFA) {
-    try {
-      const api = getFaceApi();
-      if (api) {
-        const resize = (img: HTMLImageElement) => {
-          const c = document.createElement("canvas");
-          c.width = 224;
-          c.height = 224;
-          c.getContext("2d")!.drawImage(img, 0, 0, 224, 224);
-          return c;
-        };
-        const [dA, dB] = await Promise.all([
-          api.nets.faceRecognitionNet
-            .computeFaceDescriptor(resize(searchImg))
-            .catch(() => null),
-          api.nets.faceRecognitionNet
-            .computeFaceDescriptor(resize(caseImg))
-            .catch(() => null),
-        ]);
-        if (dA && dB) {
-          const dist = descriptorDistance(
-            dA instanceof Float32Array ? dA : new Float32Array(dA),
-            dB instanceof Float32Array ? dB : new Float32Array(dB),
-          );
-          if (dist < 0.65) return distanceToScore(dist, true);
-        }
-      }
-    } catch {
-      /* ignore */
-    }
-    return -1;
-  }
-
-  const cnnDist = descriptorDistance(searchFA.descriptor, caseFA.descriptor);
-  if (cnnDist > CNN_MATCH_THRESHOLD) return -1;
-
-  let score = distanceToScore(cnnDist); // CNN score (base)
-
-  // ── Landmark geometry ──────────────────────────────────────────────────────
-  if (searchFA.landmarkDesc && caseFA.landmarkDesc) {
-    const lmDist = landmarkDistance(searchFA.landmarkDesc, caseFA.landmarkDesc);
-    const lmScore =
-      lmDist <= 0.04
-        ? 95
-        : lmDist <= 0.06
-          ? Math.round(80 + ((0.06 - lmDist) / 0.02) * 15)
-          : lmDist <= 0.1
-            ? Math.round(55 + ((0.1 - lmDist) / 0.04) * 25)
-            : lmDist <= 0.15
-              ? Math.round(30 + ((0.15 - lmDist) / 0.05) * 25)
-              : Math.max(0, Math.round(30 - ((lmDist - 0.15) / 0.15) * 30));
-    // 75% CNN + 25% landmark so far
-    score = Math.round(score * 0.75 + lmScore * 0.25);
-  }
-
-  // ── ResNet50 deep embedding ────────────────────────────────────────────────
-  try {
-    const [embA, embB] = await Promise.all([
-      extractResNet50Embedding(searchImg),
-      extractResNet50Embedding(caseImg),
-    ]);
-    if (embA && embB) {
-      const rDist = cosineDistance(embA, embB);
-      const rScore =
-        rDist <= 0.1
-          ? 95
-          : rDist <= 0.2
-            ? Math.round(75 + ((0.2 - rDist) / 0.1) * 20)
-            : rDist <= 0.35
-              ? Math.round(50 + ((0.35 - rDist) / 0.15) * 25)
-              : Math.round(Math.max(0, 50 - ((rDist - 0.35) / 0.35) * 50));
-      // Blend: 75% (CNN+landmark) + 25% ResNet50
-      score = Math.round(score * 0.75 + rScore * 0.25);
-    }
-  } catch {
-    /* ResNet50 is best-effort */
-  }
-
-  return Math.max(0, score);
-}
-
-// ─── Age-progression wrapper ──────────────────────────────────────────────────
-/**
- * Run cnnMatchScore across multiple age-progression variants of the case photo.
- * Returns the best (highest) score found.
- * Age factors tested: 0 (original), +0.4, +0.8, +1.2, -0.4 (de-aged)
- */
-async function matchWithAgeProgression(
-  searchImg: HTMLImageElement,
-  caseImgDataUrl: string,
+  caseDataUrl: string,
 ): Promise<number> {
   const ageFactors = [0, 0.4, 0.8, 1.2, -0.4];
-  let bestScore = -1;
+  let bestScore = 0;
 
   for (const factor of ageFactors) {
     let caseImg: HTMLImageElement;
     if (factor === 0) {
-      caseImg = await loadHTMLImage(caseImgDataUrl);
+      caseImg = await loadHTMLImage(caseDataUrl);
     } else {
-      const imgData = await loadImageToCanvas(caseImgDataUrl, 320, 320);
+      const imgData = await loadImageToCanvas(caseDataUrl, 320, 320);
       const aged = applyAgeProgression(imgData, factor);
       caseImg = await loadHTMLImage(imageDataToDataUrl(aged));
     }
-    const score = await cnnMatchScore(searchImg, caseImg);
+    const score = await compareFacePair(searchImg, caseImg);
     if (score > bestScore) bestScore = score;
-    if (bestScore >= 85) break; // early exit on high-confidence match
+    if (bestScore >= 85) break; // early exit on high confidence
   }
 
   return bestScore;
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
+/**
+ * Main entry point.
+ * Computes a match score [0-100] between a search photo and a registered case photo.
+ * Runs multiple preprocessing passes and accumulates the BEST score across all passes.
+ *
+ * score >= 65 → MATCH FOUND
+ * score >= 40 → POSSIBLE MATCH
+ * score >= 1  → LOW SIMILARITY
+ * score == 0  → NO FACIAL MATCH
+ */
 export async function computeMatchScore(
   searchSource: File | string,
   casePhotoUrl: string,
   onAgeProgressedDataUrl?: (dataUrl: string) => void,
 ): Promise<number> {
   try {
+    // Convert File → data URL
     let searchDataUrl: string;
     if (typeof searchSource === "string") {
       searchDataUrl = searchSource;
@@ -1023,76 +949,82 @@ export async function computeMatchScore(
       });
     }
 
-    // UI age-progression preview
+    // Age-progression preview for UI
     if (onAgeProgressedDataUrl) {
-      const imgData = await loadImageToCanvas(
-        searchDataUrl,
-        CANVAS_SIZE,
-        CANVAS_SIZE,
-      );
-      const aged = applyAgeProgression(imgData, 0.6);
-      onAgeProgressedDataUrl(imageDataToDataUrl(aged));
+      try {
+        const imgData = await loadImageToCanvas(
+          searchDataUrl,
+          CANVAS_SIZE,
+          CANVAS_SIZE,
+        );
+        const aged = applyAgeProgression(imgData, 0.6);
+        onAgeProgressedDataUrl(imageDataToDataUrl(aged));
+      } catch {
+        /* non-critical */
+      }
     }
 
-    if (faceApiLoaded) {
-      // Multi-pass preprocessing with age progression
-      const searchImgNatural = await loadHTMLImage(searchDataUrl);
-
-      // Pass 1: natural resolution + age progression
-      const score1 = await matchWithAgeProgression(
-        searchImgNatural,
-        casePhotoUrl,
-      );
-      if (score1 >= 0) return score1;
-
-      // Pass 2: contrast-normalised 320px
-      const [searchPrep2] = await Promise.all([
-        preprocessImageForFace(searchDataUrl, 320).catch(() =>
-          loadHTMLImage(searchDataUrl),
-        ),
+    // ── Histogram fallback (when models are not loaded) ────────────────────────
+    if (!faceApiLoaded) {
+      const [sd, cd] = await Promise.all([
+        loadImageToCanvas(searchDataUrl),
+        loadImageToCanvas(casePhotoUrl),
       ]);
-      const score2 = await matchWithAgeProgression(searchPrep2, casePhotoUrl);
-      if (score2 >= 0) return score2;
-
-      // Pass 3: 640px
-      const searchPrep3 = await preprocessImageForFace(
-        searchDataUrl,
-        640,
-      ).catch(() => loadHTMLImage(searchDataUrl));
-      const score3 = await matchWithAgeProgression(searchPrep3, casePhotoUrl);
-      if (score3 >= 0) return score3;
-
-      // Pass 4: 960px
-      const searchPrep4 = await preprocessImageForFace(
-        searchDataUrl,
-        960,
-      ).catch(() => loadHTMLImage(searchDataUrl));
-      const score4 = await matchWithAgeProgression(searchPrep4, casePhotoUrl);
-      if (score4 >= 0) return score4;
-
-      // Pass 5: 160px side-profile
-      const searchPrep5 = await preprocessImageForFace(
-        searchDataUrl,
-        160,
-      ).catch(() => loadHTMLImage(searchDataUrl));
-      const score5 = await matchWithAgeProgression(searchPrep5, casePhotoUrl);
-      if (score5 >= 0) return score5;
-
-      return 0; // face not detected in any pass
+      const raw = histogramIntersection(
+        extractHistogram(sd),
+        extractHistogram(cd),
+      );
+      // Heavily discount: histogram alone cannot distinguish faces
+      return Math.round(
+        Math.max(0, Math.min(100, ((raw - 0.3) / 0.5) * 100)) * 0.25,
+      );
     }
 
-    // ── Fallback: histogram only (heavily discounted) ──────────────────────────
-    const [sd, cd] = await Promise.all([
-      loadImageToCanvas(searchDataUrl),
-      loadImageToCanvas(casePhotoUrl),
-    ]);
-    const raw = histogramIntersection(
-      extractHistogram(sd),
-      extractHistogram(cd),
+    // ── CNN-based matching with multi-pass preprocessing ─────────────────────
+    // We accumulate the BEST score across all preprocessing passes.
+    let bestScore = 0;
+
+    const runPass = async (searchImg: HTMLImageElement): Promise<void> => {
+      const score = await compareWithAgeProgression(searchImg, casePhotoUrl);
+      if (score > bestScore) bestScore = score;
+    };
+
+    // Pass 1: natural resolution
+    await runPass(await loadHTMLImage(searchDataUrl));
+    if (bestScore >= 85) return bestScore;
+
+    // Pass 2: 320px normalised
+    await runPass(
+      await preprocessImage(searchDataUrl, 320).catch(() =>
+        loadHTMLImage(searchDataUrl),
+      ),
     );
-    return Math.round(
-      Math.max(0, Math.min(100, Math.round(((raw - 0.3) / 0.5) * 100))) * 0.2,
+    if (bestScore >= 85) return bestScore;
+
+    // Pass 3: 512px normalised
+    await runPass(
+      await preprocessImage(searchDataUrl, 512).catch(() =>
+        loadHTMLImage(searchDataUrl),
+      ),
     );
+    if (bestScore >= 85) return bestScore;
+
+    // Pass 4: 640px normalised
+    await runPass(
+      await preprocessImage(searchDataUrl, 640).catch(() =>
+        loadHTMLImage(searchDataUrl),
+      ),
+    );
+    if (bestScore >= 85) return bestScore;
+
+    // Pass 5: 160px (side profiles / small faces)
+    await runPass(
+      await preprocessImage(searchDataUrl, 160).catch(() =>
+        loadHTMLImage(searchDataUrl),
+      ),
+    );
+
+    return bestScore;
   } catch {
     return 0;
   }
@@ -1110,4 +1042,12 @@ export function computeFrameVariance(imageData: ImageData): number {
   }
   const mean = sum / pixels;
   return sumSq / pixels - mean * mean;
+}
+
+// ── Alias kept for backward compat ────────────────────────────────────────────
+export async function preprocessImageForFace(
+  src: string,
+  targetSize = 320,
+): Promise<HTMLImageElement> {
+  return preprocessImage(src, targetSize);
 }

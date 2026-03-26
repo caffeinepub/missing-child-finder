@@ -6,55 +6,35 @@ import { getSecretParameter } from "../utils/urlParams";
 import { useInternetIdentity } from "./useInternetIdentity";
 
 const ACTOR_QUERY_KEY = "actor";
-
-async function createActorWithRetry(
-  identity?: unknown,
-  retries = 3,
-): Promise<backendInterface> {
-  let lastError: unknown;
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    try {
-      const isAuthenticated = !!identity;
-      const actorOptions = isAuthenticated
-        ? { agentOptions: { identity } }
-        : undefined;
-
-      // @ts-ignore
-      const actor = await createActorWithConfig(actorOptions);
-
-      if (isAuthenticated) {
-        const adminToken = getSecretParameter("caffeineAdminToken") || "";
-        try {
-          await actor._initializeAccessControlWithSecret(adminToken);
-        } catch {
-          // Non-fatal: canister may be restarting. Actor still usable.
-        }
-      }
-
-      return actor;
-    } catch (err) {
-      lastError = err;
-      if (attempt < retries) {
-        await new Promise((resolve) =>
-          setTimeout(resolve, 1000 * (attempt + 1)),
-        );
-      }
-    }
-  }
-  throw lastError;
-}
-
 export function useActor() {
   const { identity } = useInternetIdentity();
   const queryClient = useQueryClient();
-
   const actorQuery = useQuery<backendInterface>({
     queryKey: [ACTOR_QUERY_KEY, identity?.getPrincipal().toString()],
-    queryFn: () => createActorWithRetry(identity),
+    queryFn: async () => {
+      const isAuthenticated = !!identity;
+
+      if (!isAuthenticated) {
+        return await createActorWithConfig();
+      }
+
+      const actorOptions = { agentOptions: { identity } };
+      const actor = await createActorWithConfig(actorOptions);
+      const adminToken = getSecretParameter("caffeineAdminToken") || "";
+
+      // Wrap in try-catch so a restarting canister never blocks actor load
+      try {
+        await actor._initializeAccessControlWithSecret(adminToken);
+      } catch {
+        // best-effort — actor is still usable
+      }
+
+      return actor;
+    },
     staleTime: Number.POSITIVE_INFINITY,
-    retry: 3,
-    retryDelay: (attempt) => 1000 * (attempt + 1),
     enabled: true,
+    retry: 3,
+    retryDelay: (attempt) => Math.min(1000 * 2 ** attempt, 8000),
   });
 
   // When the actor changes, invalidate dependent queries
