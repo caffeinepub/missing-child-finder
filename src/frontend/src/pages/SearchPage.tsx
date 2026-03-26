@@ -75,7 +75,7 @@ function getMatchLabel(score: number): { label: string; className: string } {
 
 const extractFramesFromVideo = async (
   file: File,
-  numFrames = 15,
+  numFrames = 20,
 ): Promise<string[]> => {
   return new Promise((resolve) => {
     const video = document.createElement("video");
@@ -86,8 +86,8 @@ const extractFramesFromVideo = async (
     video.addEventListener("loadedmetadata", async () => {
       const duration = video.duration;
       const canvas = document.createElement("canvas");
-      canvas.width = 320;
-      canvas.height = 240;
+      canvas.width = 640;
+      canvas.height = 480;
       const ctx = canvas.getContext("2d")!;
 
       // Skip first/last 5% of duration
@@ -105,11 +105,11 @@ const extractFramesFromVideo = async (
         await new Promise((r) =>
           video.addEventListener("seeked", r, { once: true }),
         );
-        ctx.drawImage(video, 0, 0, 320, 240);
-        const frameDataUrl = canvas.toDataURL("image/jpeg", 0.8);
+        ctx.drawImage(video, 0, 0, 640, 480);
+        const frameDataUrl = canvas.toDataURL("image/jpeg", 0.9);
 
         // Skip near-identical frames (histogram diff < 0.05)
-        const imgData = ctx.getImageData(0, 0, 320, 240);
+        const imgData = ctx.getImageData(0, 0, 640, 480);
         const hist = extractHistogram(imgData);
         if (prevHist !== null) {
           const diff = hist.reduce(
@@ -130,8 +130,8 @@ const extractFramesFromVideo = async (
           await new Promise((r) =>
             video.addEventListener("seeked", r, { once: true }),
           );
-          ctx.drawImage(video, 0, 0, 320, 240);
-          collected.push(canvas.toDataURL("image/jpeg", 0.8));
+          ctx.drawImage(video, 0, 0, 640, 480);
+          collected.push(canvas.toDataURL("image/jpeg", 0.9));
         }
       }
 
@@ -483,19 +483,55 @@ export default function SearchPage() {
   };
 
   const handleCaptureAndSearch = async () => {
-    const frames: File[] = [];
-    for (let i = 0; i < 3; i++) {
-      const file = await camera.capturePhoto();
-      if (file) frames.push(file);
-      if (i < 2) await new Promise((r) => setTimeout(r, 80));
-    }
-    const file = frames[frames.length - 1] ?? null;
-    if (file) {
-      handlePhoto(file);
-      await runSearch(file);
-    }
-  };
+    if (!camera.videoRef.current || !camera.isActive) return;
+    const video = camera.videoRef.current;
 
+    const capturedFrames: File[] = [];
+    for (let i = 0; i < 5; i++) {
+      const w = video.videoWidth || 640;
+      const h = video.videoHeight || 480;
+      const cap = document.createElement("canvas");
+      cap.width = w;
+      cap.height = h;
+      const ctx = cap.getContext("2d");
+      if (ctx) {
+        ctx.drawImage(video, 0, 0, w, h);
+        const blob = await new Promise<Blob | null>((r) =>
+          cap.toBlob(r, "image/jpeg", 0.92),
+        );
+        if (blob)
+          capturedFrames.push(
+            new File([blob], `frame${i}.jpg`, { type: "image/jpeg" }),
+          );
+      }
+      if (i < 4) await new Promise((r) => setTimeout(r, 100));
+    }
+
+    if (capturedFrames.length === 0) return;
+
+    // Pick the best frame: first one with a detected face
+    let bestFrame = capturedFrames[Math.floor(capturedFrames.length / 2)];
+    for (const frame of capturedFrames) {
+      const dataUrl = await new Promise<string>((resolve) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.readAsDataURL(frame);
+      });
+      const img = new Image();
+      img.src = dataUrl;
+      await new Promise<void>((r) => {
+        img.onload = () => r();
+      });
+      const hasFace = await detectFaceInImage(img);
+      if (hasFace) {
+        bestFrame = frame;
+        break;
+      }
+    }
+
+    handlePhoto(bestFrame);
+    await runSearch(bestFrame);
+  };
   const handleTabChange = (value: string) => {
     if (value !== "camera" && camera.isActive) {
       camera.stopCamera();
