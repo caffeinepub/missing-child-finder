@@ -18,17 +18,20 @@ export function useActor() {
         return await createActorWithConfig();
       }
 
-      const actorOptions = { agentOptions: { identity } };
+      const actorOptions = {
+        agentOptions: {
+          identity,
+        },
+      };
+
       const actor = await createActorWithConfig(actorOptions);
       const adminToken = getSecretParameter("caffeineAdminToken") || "";
-
-      // Wrap in try-catch so a restarting canister never blocks actor load
+      // Wrap in try-catch so a restarting/stopped canister never blocks the actor
       try {
         await actor._initializeAccessControlWithSecret(adminToken);
       } catch {
-        // best-effort — actor is still usable
+        // Canister may be mid-restart; actor is still usable for other calls
       }
-
       return actor;
     },
     staleTime: Number.POSITIVE_INFINITY,
@@ -41,10 +44,14 @@ export function useActor() {
   useEffect(() => {
     if (actorQuery.data) {
       queryClient.invalidateQueries({
-        predicate: (query) => !query.queryKey.includes(ACTOR_QUERY_KEY),
+        predicate: (query) => {
+          return !query.queryKey.includes(ACTOR_QUERY_KEY);
+        },
       });
       queryClient.refetchQueries({
-        predicate: (query) => !query.queryKey.includes(ACTOR_QUERY_KEY),
+        predicate: (query) => {
+          return !query.queryKey.includes(ACTOR_QUERY_KEY);
+        },
       });
     }
   }, [actorQuery.data, queryClient]);
