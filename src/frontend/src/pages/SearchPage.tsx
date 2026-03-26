@@ -11,6 +11,7 @@ import {
   Loader2,
   Search,
   ShieldAlert,
+  SwitchCamera,
   Upload,
   Video,
   X,
@@ -28,6 +29,7 @@ import {
 } from "../hooks/useQueries";
 import {
   areModelsLoaded,
+  clearSearchFaceCache,
   computeFrameVariance,
   computeMatchScore,
   detectFaceInImage,
@@ -473,6 +475,7 @@ export default function SearchPage() {
 
   const handleCaptureAndSearch = async () => {
     if (!camera.videoRef.current || !camera.isActive) return;
+    clearSearchFaceCache();
     const video = camera.videoRef.current;
 
     const capturedFrames: File[] = [];
@@ -674,7 +677,10 @@ export default function SearchPage() {
                     data-ocid="search.upload_button"
                     onChange={(e) => {
                       const file = e.target.files?.[0];
-                      if (file) handlePhoto(file);
+                      if (file) {
+                        clearSearchFaceCache();
+                        handlePhoto(file);
+                      }
                     }}
                   />
                 </button>
@@ -797,6 +803,7 @@ export default function SearchPage() {
                     onChange={(e) => {
                       const file = e.target.files?.[0];
                       if (file) {
+                        clearSearchFaceCache();
                         setVideoFile(file);
                         setResults([]);
                         setPhase("idle");
@@ -1046,6 +1053,26 @@ export default function SearchPage() {
                     >
                       <X className="w-4 h-4" />
                       Stop Camera
+                    </Button>
+                    <Button
+                      variant="outline"
+                      onClick={() => camera.switchCamera()}
+                      disabled={camera.isLoading}
+                      className="gap-2"
+                      title={
+                        camera.currentFacingMode === "user"
+                          ? "Switch to back camera"
+                          : "Switch to front camera"
+                      }
+                    >
+                      {camera.isLoading ? (
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                      ) : (
+                        <SwitchCamera className="w-4 h-4" />
+                      )}
+                      {camera.currentFacingMode === "user"
+                        ? "Back Camera"
+                        : "Front Camera"}
                     </Button>
                   </>
                 )}

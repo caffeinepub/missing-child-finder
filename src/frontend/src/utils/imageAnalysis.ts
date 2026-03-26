@@ -47,7 +47,13 @@ const BINS = 32;
  * We use 0.75 as the max threshold — anything below returns a score,
  * anything above returns 0 (not a match).
  */
-const CNN_THRESHOLD = 0.75;
+const CNN_THRESHOLD = 0.72;
+
+// ─── Search face cache (avoids re-detecting the same search image N times) ────
+const searchFaceCache = new Map<string, FaceAnalysis | null>();
+export function clearSearchFaceCache() {
+  searchFaceCache.clear();
+}
 
 // ─── Global model state ───────────────────────────────────────────────────────
 let faceApiLoaded = false;
@@ -702,72 +708,89 @@ async function extractFaceAnalysis(
     return null;
   };
 
-  // Ordered strategies: progressively more permissive
-  const strategies = [
-    () => tryDetect(new api.SsdMobilenetv1Options({ minConfidence: 0.5 })),
-    () =>
-      tryDetect(
-        new api.TinyFaceDetectorOptions({
-          inputSize: 512,
-          scoreThreshold: 0.4,
-        }),
-      ),
-    () => tryDetect(new api.SsdMobilenetv1Options({ minConfidence: 0.35 })),
-    () =>
-      tryDetect(
-        new api.TinyFaceDetectorOptions({
-          inputSize: 416,
-          scoreThreshold: 0.3,
-        }),
-      ),
-    () => tryDetect(new api.SsdMobilenetv1Options({ minConfidence: 0.2 })),
-    () =>
-      tryDetect(
-        new api.TinyFaceDetectorOptions({
-          inputSize: 608,
-          scoreThreshold: 0.2,
-        }),
-      ),
-    () => tryDetect(new api.SsdMobilenetv1Options({ minConfidence: 0.08 })),
-    () =>
-      tryDetect(
-        new api.TinyFaceDetectorOptions({
-          inputSize: 320,
-          scoreThreshold: 0.1,
-        }),
-      ),
-  ];
+  // ── Parallel strategy groups (fast-first, permissive fallback) ─────────────
+  // Group 1: high confidence, fastest detectors
+  const group1 = await Promise.all([
+    tryDetect(new api.SsdMobilenetv1Options({ minConfidence: 0.5 })),
+    tryDetect(
+      new api.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.4 }),
+    ),
+  ]);
+  const found1 = group1.find((r) => r !== null);
+  if (found1) return found1;
 
-  for (const s of strategies) {
-    const r = await s();
-    if (r) return r;
-  }
+  // Group 2: medium confidence
+  const group2 = await Promise.all([
+    tryDetect(new api.SsdMobilenetv1Options({ minConfidence: 0.3 })),
+    tryDetect(
+      new api.TinyFaceDetectorOptions({ inputSize: 416, scoreThreshold: 0.25 }),
+    ),
+  ]);
+  const found2 = group2.find((r) => r !== null);
+  if (found2) return found2;
 
-  // Try BlazeFace crop → face-api.js
-  const blazeCrop = await cropFaceBlazeFace(imgEl);
-  if (blazeCrop) {
-    for (const opts of [
-      new api.SsdMobilenetv1Options({ minConfidence: 0.3 }),
-      new api.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.25 }),
-    ]) {
-      const r = await tryDetect(opts, blazeCrop);
-      if (r) return r;
-    }
-  }
-
-  // Try YOLOv8 crop → face-api.js
-  const yoloCrop = await cropFaceYolov8(imgEl);
-  if (yoloCrop) {
-    for (const opts of [
-      new api.SsdMobilenetv1Options({ minConfidence: 0.3 }),
-      new api.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.25 }),
-    ]) {
-      const r = await tryDetect(opts, yoloCrop);
-      if (r) return r;
-    }
-  }
+  // Group 3: permissive + enhanced crops all in parallel
+  const [blazeCrop, yoloCrop] = await Promise.all([
+    cropFaceBlazeFace(imgEl),
+    cropFaceYolov8(imgEl),
+  ]);
+  const group3 = await Promise.all([
+    tryDetect(new api.SsdMobilenetv1Options({ minConfidence: 0.15 })),
+    tryDetect(
+      new api.TinyFaceDetectorOptions({ inputSize: 608, scoreThreshold: 0.15 }),
+    ),
+    blazeCrop
+      ? tryDetect(
+          new api.SsdMobilenetv1Options({ minConfidence: 0.3 }),
+          blazeCrop,
+        )
+      : Promise.resolve(null),
+    blazeCrop
+      ? tryDetect(
+          new api.TinyFaceDetectorOptions({
+            inputSize: 512,
+            scoreThreshold: 0.25,
+          }),
+          blazeCrop,
+        )
+      : Promise.resolve(null),
+    yoloCrop
+      ? tryDetect(
+          new api.SsdMobilenetv1Options({ minConfidence: 0.3 }),
+          yoloCrop,
+        )
+      : Promise.resolve(null),
+    yoloCrop
+      ? tryDetect(
+          new api.TinyFaceDetectorOptions({
+            inputSize: 512,
+            scoreThreshold: 0.25,
+          }),
+          yoloCrop,
+        )
+      : Promise.resolve(null),
+  ]);
+  const found3 = group3.find((r) => r !== null);
+  if (found3) return found3;
 
   return null;
+}
+
+// ─── Single-extract helper for search image ───────────────────────────────────
+/**
+ * Extracts face analysis for a search image ONCE and caches the result.
+ * Subsequent calls with the same dataUrl return the cached value instantly.
+ */
+export async function extractSearchFaceOnce(
+  searchDataUrl: string,
+): Promise<FaceAnalysis | null> {
+  if (searchFaceCache.has(searchDataUrl)) {
+    return searchFaceCache.get(searchDataUrl)!;
+  }
+  const img = await loadHTMLImage(searchDataUrl);
+  const fa = await extractFaceAnalysis(img);
+  searchFaceCache.set(searchDataUrl, fa ?? null);
+  return fa ?? null;
 }
 
 // ─── Whole-image CNN fallback ─────────────────────────────────────────────────
@@ -805,9 +828,12 @@ async function wholeImageDescriptor(
 async function compareFacePair(
   searchImg: HTMLImageElement,
   caseImg: HTMLImageElement,
+  precomputedSearchFA?: FaceAnalysis | null,
 ): Promise<number> {
   const [searchFA, caseFA] = await Promise.all([
-    extractFaceAnalysis(searchImg),
+    precomputedSearchFA !== undefined
+      ? Promise.resolve(precomputedSearchFA)
+      : extractFaceAnalysis(searchImg),
     extractFaceAnalysis(caseImg),
   ]);
 
@@ -898,25 +924,32 @@ export async function detectFaceInImage(
 async function compareWithAgeProgression(
   searchImg: HTMLImageElement,
   caseDataUrl: string,
+  precomputedSearchFA?: FaceAnalysis | null,
 ): Promise<number> {
-  const ageFactors = [0, 0.4, 0.8, 1.2, -0.4];
-  let bestScore = 0;
+  // Run 3 age variants in parallel for speed: original, +0.8 forward, -0.4 de-aged
+  const ageFactors = [0, 0.8, -0.4];
 
-  for (const factor of ageFactors) {
-    let caseImg: HTMLImageElement;
-    if (factor === 0) {
-      caseImg = await loadHTMLImage(caseDataUrl);
-    } else {
-      const imgData = await loadImageToCanvas(caseDataUrl, 320, 320);
-      const aged = applyAgeProgression(imgData, factor);
-      caseImg = await loadHTMLImage(imageDataToDataUrl(aged));
-    }
-    const score = await compareFacePair(searchImg, caseImg);
-    if (score > bestScore) bestScore = score;
-    if (bestScore >= 85) break; // early exit on high confidence
-  }
+  const imgDataCache: ImageData | null = null;
+  const getAgedImg = async (factor: number): Promise<HTMLImageElement> => {
+    if (factor === 0) return loadHTMLImage(caseDataUrl);
+    const imgData = await loadImageToCanvas(caseDataUrl, 320, 320);
+    const aged = applyAgeProgression(imgData, factor);
+    return loadHTMLImage(imageDataToDataUrl(aged));
+  };
+  void imgDataCache; // suppress unused warning
 
-  return bestScore;
+  const scores = await Promise.all(
+    ageFactors.map(async (factor) => {
+      try {
+        const caseImg = await getAgedImg(factor);
+        return compareFacePair(searchImg, caseImg, precomputedSearchFA);
+      } catch {
+        return 0;
+      }
+    }),
+  );
+
+  return Math.max(...scores, 0);
 }
 
 // ─── Public API ───────────────────────────────────────────────────────────────
@@ -984,45 +1017,47 @@ export async function computeMatchScore(
     // We accumulate the BEST score across all preprocessing passes.
     let bestScore = 0;
 
+    // Extract search face ONCE and cache — avoids re-running detection N times
+    const cachedSearchFA = searchFaceCache.has(searchDataUrl)
+      ? searchFaceCache.get(searchDataUrl)!
+      : await (async () => {
+          const naturalImg = await loadHTMLImage(searchDataUrl);
+          const fa = await extractFaceAnalysis(naturalImg);
+          searchFaceCache.set(searchDataUrl, fa ?? null);
+          return fa ?? null;
+        })();
+
     const runPass = async (searchImg: HTMLImageElement): Promise<void> => {
-      const score = await compareWithAgeProgression(searchImg, casePhotoUrl);
+      const score = await compareWithAgeProgression(
+        searchImg,
+        casePhotoUrl,
+        cachedSearchFA,
+      );
       if (score > bestScore) bestScore = score;
     };
 
-    // Pass 1: natural resolution
-    await runPass(await loadHTMLImage(searchDataUrl));
-    if (bestScore >= 85) return bestScore;
-
-    // Pass 2: 320px normalised
-    await runPass(
-      await preprocessImage(searchDataUrl, 320).catch(() =>
+    // Run 3 resolution passes in parallel for speed
+    // Natural + 512px + 320px cover most face sizes efficiently
+    const passImages = await Promise.all([
+      loadHTMLImage(searchDataUrl),
+      preprocessImage(searchDataUrl, 512).catch(() =>
         loadHTMLImage(searchDataUrl),
       ),
-    );
-    if (bestScore >= 85) return bestScore;
-
-    // Pass 3: 512px normalised
-    await runPass(
-      await preprocessImage(searchDataUrl, 512).catch(() =>
+      preprocessImage(searchDataUrl, 320).catch(() =>
         loadHTMLImage(searchDataUrl),
       ),
-    );
-    if (bestScore >= 85) return bestScore;
+    ]);
 
-    // Pass 4: 640px normalised
-    await runPass(
-      await preprocessImage(searchDataUrl, 640).catch(() =>
-        loadHTMLImage(searchDataUrl),
-      ),
-    );
-    if (bestScore >= 85) return bestScore;
+    await Promise.all(passImages.map((img) => runPass(img)));
 
-    // Pass 5: 160px (side profiles / small faces)
-    await runPass(
-      await preprocessImage(searchDataUrl, 160).catch(() =>
-        loadHTMLImage(searchDataUrl),
-      ),
-    );
+    // If still no confident match, try 640px high-res pass sequentially
+    if (bestScore < 65) {
+      await runPass(
+        await preprocessImage(searchDataUrl, 640).catch(() =>
+          loadHTMLImage(searchDataUrl),
+        ),
+      );
+    }
 
     return bestScore;
   } catch {
