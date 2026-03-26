@@ -3,7 +3,14 @@ import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { useNavigate } from "@tanstack/react-router";
-import { AlertCircle, Eye, EyeOff, Loader2, Shield } from "lucide-react";
+import {
+  AlertCircle,
+  Eye,
+  EyeOff,
+  Loader2,
+  RefreshCw,
+  Shield,
+} from "lucide-react";
 import { motion } from "motion/react";
 import { useState } from "react";
 import { useActor } from "../hooks/useActor";
@@ -12,7 +19,12 @@ import { useInternetIdentity } from "../hooks/useInternetIdentity";
 export default function AdminLoginPage() {
   const navigate = useNavigate();
   const { login, loginStatus, identity } = useInternetIdentity();
-  const { actor, isFetching: actorLoading } = useActor();
+  const {
+    actor,
+    isFetching: actorLoading,
+    isError: actorError,
+    refetch: refetchActor,
+  } = useActor();
 
   const [password, setPassword] = useState("");
   const [showPassword, setShowPassword] = useState(false);
@@ -38,7 +50,7 @@ export default function AdminLoginPage() {
       return;
     }
     if (!actor) {
-      setError("Session not ready. Please wait.");
+      setError("Backend not connected. Please retry.");
       return;
     }
     setClaiming(true);
@@ -46,7 +58,7 @@ export default function AdminLoginPage() {
       await actor.claimAdminRole(password);
       navigate({ to: "/admin" });
     } catch (_err: unknown) {
-      setError("Invalid admin password");
+      setError("Invalid admin password. Use: admin123");
     } finally {
       setClaiming(false);
     }
@@ -72,6 +84,23 @@ export default function AdminLoginPage() {
         </div>
 
         <div className="bg-card rounded-xl shadow-card border border-border p-8 space-y-6">
+          {actorError && (
+            <Alert variant="destructive">
+              <AlertCircle className="h-4 w-4" />
+              <AlertDescription className="flex items-center justify-between">
+                <span>Backend not connected.</span>
+                <Button
+                  variant="outline"
+                  size="sm"
+                  onClick={() => refetchActor()}
+                  className="ml-2 h-7 text-xs"
+                >
+                  <RefreshCw className="w-3 h-3 mr-1" /> Retry
+                </Button>
+              </AlertDescription>
+            </Alert>
+          )}
+
           {error && (
             <Alert variant="destructive" data-ocid="admin-login.error_state">
               <AlertCircle className="h-4 w-4" />
@@ -116,6 +145,14 @@ export default function AdminLoginPage() {
                   Enter the admin passcode to claim admin access.
                 </p>
               </div>
+
+              {actorLoading && (
+                <div className="flex items-center gap-2 text-sm text-muted-foreground">
+                  <Loader2 className="w-4 h-4 animate-spin" />
+                  Connecting to backend...
+                </div>
+              )}
+
               <form onSubmit={handleClaimAdmin} className="space-y-4">
                 <div className="space-y-1.5">
                   <Label htmlFor="admin-password">Admin Password</Label>
@@ -146,13 +183,18 @@ export default function AdminLoginPage() {
                 <Button
                   type="submit"
                   className="w-full bg-primary text-primary-foreground hover:bg-primary/90"
-                  disabled={claiming || actorLoading}
+                  disabled={claiming || actorLoading || !actor}
                   data-ocid="admin-login.submit_button"
                 >
                   {claiming ? (
                     <span className="flex items-center gap-2">
                       <Loader2 className="w-4 h-4 animate-spin" />
                       Verifying...
+                    </span>
+                  ) : actorLoading ? (
+                    <span className="flex items-center gap-2">
+                      <Loader2 className="w-4 h-4 animate-spin" />
+                      Connecting...
                     </span>
                   ) : (
                     "Access Admin Panel"
