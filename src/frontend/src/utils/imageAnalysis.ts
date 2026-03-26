@@ -1,16 +1,19 @@
-// BlazeFace (TensorFlow.js) CDNs -- loaded for better face detection
-const TFJS_CDN =
-  "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js";
-const BLAZEFACE_CDN =
-  "https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@0.0.7/dist/blazeface.min.js";
+// ═══════════════════════════════════════════════════════════════════════════
+// Missing Child Finder – Face Analysis Engine
+// Models: face-api.js (CNN) · BlazeFace (TF.js) · ResNet50 (TF.js) ·
+//         YOLOv8-ONNX (onnxruntime-web) · Age Progression
+// ═══════════════════════════════════════════════════════════════════════════
 
-let blazefaceModel: unknown = null;
-let blazefaceLoading: Promise<void> | null = null;
+// ─── CDN versions ────────────────────────────────────────────────────────────
+const TFJS_VERSION = "4.22.0";
+const BLAZEFACE_VERSION = "0.0.7";
+const ORT_VERSION = "1.18.0";
 
-const CANVAS_SIZE = 64;
-const BINS = 32;
+const TFJS_CDN = `https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@${TFJS_VERSION}/dist/tf.min.js`;
+const BLAZEFACE_CDN = `https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@${BLAZEFACE_VERSION}/dist/blazeface.min.js`;
+const ORT_CDN = `https://cdn.jsdelivr.net/npm/onnxruntime-web@${ORT_VERSION}/dist/ort.min.js`;
 
-// CDN list for face-api script -- tried in order
+// face-api.js CDN list (tried in order, first available wins)
 const FACEAPI_CDNS = [
   "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.js",
   "https://unpkg.com/@vladmandic/face-api@1.7.13/dist/face-api.js",
@@ -20,7 +23,7 @@ const FACEAPI_CDNS = [
   "https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js",
 ];
 
-// CDN list for model weights -- tried in order
+// face-api model weight CDNs
 const MODEL_URLS = [
   "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model",
   "https://unpkg.com/@vladmandic/face-api/model",
@@ -30,8 +33,40 @@ const MODEL_URLS = [
   "https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights",
 ];
 
-let modelsLoaded = false;
-let modelsLoading: Promise<void> | null = null;
+// ResNet50 feature vector model (TF.js SavedModel format on TFHub)
+const RESNET50_TFJS_URLS = [
+  "https://tfhub.dev/google/tfjs-model/imagenet/resnet_v2_50/feature_vector/1/default/1",
+  "https://storage.googleapis.com/tfjs-models/savedmodel/resnet50_imagenet/model.json",
+];
+
+// YOLOv8-nano face detection ONNX model
+const YOLOV8_ONNX_URLS = [
+  "https://huggingface.co/spaces/nicehorse/yolov8-face-detection/resolve/main/yolov8n-face.onnx",
+  "https://raw.githubusercontent.com/akanametov/yolo-face/main/weights/yolov8n-face.onnx",
+];
+
+const CANVAS_SIZE = 64;
+const BINS = 32;
+
+/** CNN distance below this = genuine face match (same person in different lighting: 0.30–0.65) */
+const CNN_MATCH_THRESHOLD = 0.72;
+
+// ─── Global model state ───────────────────────────────────────────────────────
+let faceApiLoaded = false;
+let faceApiLoading: Promise<void> | null = null;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let blazefaceModel: any = null;
+let blazefaceLoading: Promise<void> | null = null;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let resnet50Model: any = null;
+let resnet50Loading: Promise<void> | null = null;
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+let yolov8Session: any = null;
+let yolov8Loading: Promise<void> | null = null;
+
 let modelLoadError: string | null = null;
 
 declare global {
@@ -42,6 +77,8 @@ declare global {
     tf: any;
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     blazeface: any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    ort: any;
   }
 }
 
@@ -50,39 +87,42 @@ function getFaceApi(): any {
   return typeof window !== "undefined" ? window.faceapi : null;
 }
 
+// ─── Script loader ────────────────────────────────────────────────────────────
 function loadScript(src: string): Promise<void> {
   return new Promise((resolve, reject) => {
-    const existing = document.querySelector(`script[src="${src}"]`);
-    if (existing) {
+    if (document.querySelector(`script[src="${src}"]`)) {
       resolve();
       return;
     }
-    const script = document.createElement("script");
-    script.src = src;
-    script.onload = () => resolve();
-    script.onerror = () => reject(new Error(`Failed to load: ${src}`));
-    document.head.appendChild(script);
+    const s = document.createElement("script");
+    s.src = src;
+    s.onload = () => resolve();
+    s.onerror = () => reject(new Error(`Failed to load: ${src}`));
+    document.head.appendChild(s);
   });
 }
 
-async function loadScriptWithFallback(): Promise<void> {
-  let lastError: Error | null = null;
-  for (const cdn of FACEAPI_CDNS) {
+async function loadScriptWithFallback(
+  cdns: string[],
+  checkFn: () => boolean,
+): Promise<void> {
+  for (const cdn of cdns) {
     try {
       await loadScript(cdn);
-      for (let i = 0; i < 10; i++) {
-        if (getFaceApi()) return;
-        await new Promise((r) => setTimeout(r, 50));
+      for (let i = 0; i < 20; i++) {
+        if (checkFn()) return;
+        await new Promise((r) => setTimeout(r, 100));
       }
-      if (getFaceApi()) return;
-    } catch (e) {
-      lastError = e as Error;
+      if (checkFn()) return;
+    } catch {
+      /* try next */
     }
   }
-  throw lastError ?? new Error("All face-api CDNs failed");
+  throw new Error(`All CDNs failed: ${cdns[0]}`);
 }
 
-async function loadModelsFromUrl(modelUrl: string): Promise<void> {
+// ─── 1. face-api.js loader ────────────────────────────────────────────────────
+async function loadFaceApiModels(modelUrl: string): Promise<void> {
   const api = getFaceApi();
   if (!api) throw new Error("face-api not loaded");
   await Promise.all([
@@ -93,162 +133,155 @@ async function loadModelsFromUrl(modelUrl: string): Promise<void> {
   ]);
 }
 
-export async function ensureModelsLoaded(): Promise<void> {
-  if (modelsLoaded) return;
-  if (modelsLoading) return modelsLoading;
-
-  modelsLoading = (async () => {
+async function initFaceApi(): Promise<void> {
+  await loadScriptWithFallback(FACEAPI_CDNS, () => !!getFaceApi());
+  for (const url of MODEL_URLS) {
     try {
-      await loadScriptWithFallback();
-      let loaded = false;
-      for (const modelUrl of MODEL_URLS) {
-        try {
-          await loadModelsFromUrl(modelUrl);
-          loaded = true;
-          break;
-        } catch {
-          // try next CDN
-        }
-      }
-      if (loaded) {
-        modelsLoaded = true;
-        modelLoadError = null;
-        // Kick off BlazeFace load in parallel (non-blocking)
-        loadBlazeFace().catch(() => {});
-      } else {
-        modelLoadError =
-          "Could not load face recognition models. Using histogram fallback.";
-        modelsLoading = null;
-      }
-    } catch (e) {
-      modelLoadError = (e as Error).message ?? "Model load failed";
-      modelsLoading = null;
+      await loadFaceApiModels(url);
+      return;
+    } catch {
+      /* try next */
     }
-  })();
-
-  return modelsLoading;
+  }
+  throw new Error("All face-api model CDNs failed");
 }
 
-export function areModelsLoaded(): boolean {
-  return modelsLoaded;
-}
-
-export function getModelLoadError(): string | null {
-  return modelLoadError;
-}
-
-async function loadBlazeFace(): Promise<void> {
+// ─── 2. BlazeFace loader (TensorFlow.js) ─────────────────────────────────────
+async function initBlazeFace(): Promise<void> {
   if (blazefaceModel) return;
   if (blazefaceLoading) return blazefaceLoading;
-
   blazefaceLoading = (async () => {
     try {
-      // Load TF.js if not already loaded
       if (!window.tf) {
-        await new Promise<void>((resolve, reject) => {
-          const script = document.createElement("script");
-          script.src = TFJS_CDN;
-          script.onload = () => resolve();
-          script.onerror = () => reject(new Error("TF.js load failed"));
-          document.head.appendChild(script);
-        });
-        // Wait for tf global
+        await loadScript(TFJS_CDN);
         for (let i = 0; i < 20; i++) {
           if (window.tf) break;
           await new Promise((r) => setTimeout(r, 100));
         }
       }
-
-      // Load BlazeFace
-      if (!window.blazeface) {
-        await new Promise<void>((resolve, reject) => {
-          const script = document.createElement("script");
-          script.src = BLAZEFACE_CDN;
-          script.onload = () => resolve();
-          script.onerror = () => reject(new Error("BlazeFace load failed"));
-          document.head.appendChild(script);
-        });
-        for (let i = 0; i < 20; i++) {
-          if (window.blazeface) break;
-          await new Promise((r) => setTimeout(r, 100));
-        }
+      await loadScript(BLAZEFACE_CDN);
+      for (let i = 0; i < 20; i++) {
+        if (window.blazeface) break;
+        await new Promise((r) => setTimeout(r, 100));
       }
-
       if (window.blazeface?.load) {
         blazefaceModel = await window.blazeface.load();
       }
     } catch {
-      // BlazeFace is optional -- face-api.js is still the primary detector
       blazefaceLoading = null;
     }
   })();
-
   return blazefaceLoading;
 }
 
-/**
- * Use BlazeFace to detect a face bounding box, then crop the image to that
- * region for better descriptor extraction with face-api.js
- */
-async function cropFaceWithBlazeFace(
-  imgEl: HTMLImageElement,
-): Promise<HTMLImageElement | null> {
-  try {
-    if (!blazefaceModel) await loadBlazeFace();
-    if (!blazefaceModel) return null;
-
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const model = blazefaceModel as any;
-    const predictions = await model.estimateFaces(imgEl, false);
-
-    if (!predictions || predictions.length === 0) return null;
-
-    // Pick the largest face
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const best = predictions.reduce((prev: any, curr: any) => {
-      const prevArea =
-        (prev.bottomRight[0] - prev.topLeft[0]) *
-        (prev.bottomRight[1] - prev.topLeft[1]);
-      const currArea =
-        (curr.bottomRight[0] - curr.topLeft[0]) *
-        (curr.bottomRight[1] - curr.topLeft[1]);
-      return currArea > prevArea ? curr : prev;
-    });
-
-    // Add 20% padding around the bounding box
-    const x1 = best.topLeft[0] as number;
-    const y1 = best.topLeft[1] as number;
-    const x2 = best.bottomRight[0] as number;
-    const y2 = best.bottomRight[1] as number;
-    const w = x2 - x1;
-    const h = y2 - y1;
-    const pad = 0.2;
-
-    const cropX = Math.max(0, x1 - w * pad);
-    const cropY = Math.max(0, y1 - h * pad);
-    const cropW = Math.min(imgEl.naturalWidth - cropX, w * (1 + 2 * pad));
-    const cropH = Math.min(imgEl.naturalHeight - cropY, h * (1 + 2 * pad));
-
-    if (cropW < 20 || cropH < 20) return null;
-
-    // Draw cropped face at 512x512 for best descriptor quality
-    const canvas = document.createElement("canvas");
-    canvas.width = 512;
-    canvas.height = 512;
-    const ctx = canvas.getContext("2d")!;
-    ctx.drawImage(imgEl, cropX, cropY, cropW, cropH, 0, 0, 512, 512);
-
-    return new Promise<HTMLImageElement>((resolve, reject) => {
-      const img = new Image();
-      img.onload = () => resolve(img);
-      img.onerror = reject;
-      img.src = canvas.toDataURL("image/jpeg", 0.95);
-    });
-  } catch {
-    return null;
-  }
+// ─── 3. ResNet50 loader (TensorFlow.js graph model) ──────────────────────────
+async function initResNet50(): Promise<void> {
+  if (resnet50Model) return;
+  if (resnet50Loading) return resnet50Loading;
+  resnet50Loading = (async () => {
+    try {
+      if (!window.tf) {
+        await loadScript(TFJS_CDN);
+        for (let i = 0; i < 20; i++) {
+          if (window.tf) break;
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+      const tf = window.tf;
+      if (!tf) {
+        resnet50Loading = null;
+        return;
+      }
+      for (const url of RESNET50_TFJS_URLS) {
+        try {
+          resnet50Model = await tf.loadGraphModel(url, {
+            fromTFHub: url.includes("tfhub.dev"),
+          });
+          if (resnet50Model) return;
+        } catch {
+          /* try next */
+        }
+      }
+      resnet50Loading = null;
+    } catch {
+      resnet50Loading = null;
+    }
+  })();
+  return resnet50Loading;
 }
 
+// ─── 4. YOLOv8-ONNX loader (onnxruntime-web) ─────────────────────────────────
+async function initYolov8(): Promise<void> {
+  if (yolov8Session) return;
+  if (yolov8Loading) return yolov8Loading;
+  yolov8Loading = (async () => {
+    try {
+      if (!window.ort) {
+        await loadScript(ORT_CDN);
+        for (let i = 0; i < 20; i++) {
+          if (window.ort) break;
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+      if (!window.ort) {
+        yolov8Loading = null;
+        return;
+      }
+      for (const url of YOLOV8_ONNX_URLS) {
+        try {
+          const session = await window.ort.InferenceSession.create(url, {
+            executionProviders: ["wasm"],
+            graphOptimizationLevel: "all",
+          });
+          if (session) {
+            yolov8Session = session;
+            return;
+          }
+        } catch {
+          /* try next */
+        }
+      }
+      yolov8Loading = null;
+    } catch {
+      yolov8Loading = null;
+    }
+  })();
+  return yolov8Loading;
+}
+
+// ─── Master init ──────────────────────────────────────────────────────────────
+export async function ensureModelsLoaded(): Promise<void> {
+  if (faceApiLoaded) return;
+  if (faceApiLoading) return faceApiLoading;
+
+  faceApiLoading = (async () => {
+    try {
+      await initFaceApi();
+      faceApiLoaded = true;
+      modelLoadError = null;
+      // Load the remaining three models non-blocking in parallel
+      Promise.all([
+        initBlazeFace().catch(() => {}),
+        initResNet50().catch(() => {}),
+        initYolov8().catch(() => {}),
+      ]);
+    } catch (e) {
+      modelLoadError = (e as Error).message ?? "Model load failed";
+      faceApiLoading = null;
+    }
+  })();
+
+  return faceApiLoading;
+}
+
+export function areModelsLoaded(): boolean {
+  return faceApiLoaded;
+}
+export function getModelLoadError(): string | null {
+  return modelLoadError;
+}
+
+// ─── Image helpers ────────────────────────────────────────────────────────────
 export async function loadImageToCanvas(
   src: string,
   width = CANVAS_SIZE,
@@ -258,10 +291,10 @@ export async function loadImageToCanvas(
     const img = new Image();
     img.crossOrigin = "anonymous";
     img.onload = () => {
-      const canvas = document.createElement("canvas");
-      canvas.width = width;
-      canvas.height = height;
-      const ctx = canvas.getContext("2d");
+      const c = document.createElement("canvas");
+      c.width = width;
+      c.height = height;
+      const ctx = c.getContext("2d");
       if (!ctx) return reject(new Error("No canvas context"));
       ctx.drawImage(img, 0, 0, width, height);
       resolve(ctx.getImageData(0, 0, width, height));
@@ -281,42 +314,19 @@ function loadHTMLImage(src: string): Promise<HTMLImageElement> {
   });
 }
 
-/**
- * Load an image at its natural size (no forced resize).
- * Used when we want the detector to see the full resolution.
- */
-function loadHTMLImageNatural(src: string): Promise<HTMLImageElement> {
-  return new Promise((resolve, reject) => {
-    const img = new Image();
-    img.crossOrigin = "anonymous";
-    img.onload = () => resolve(img);
-    img.onerror = () => reject(new Error("Failed to load image"));
-    img.src = src;
-  });
-}
-
-/**
- * Resize image to targetSize x targetSize and apply contrast normalization.
- */
 export async function preprocessImageForFace(
   src: string,
   targetSize = 320,
 ): Promise<HTMLImageElement> {
   const imageData = await loadImageToCanvas(src, targetSize, targetSize);
   const data = imageData.data;
-
-  const grayValues: number[] = [];
-  for (let i = 0; i < data.length; i += 4) {
-    grayValues.push(
-      0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2],
-    );
-  }
-  grayValues.sort((a, b) => a - b);
-
-  const p2 = grayValues[Math.floor(grayValues.length * 0.02)] ?? 0;
-  const p98 = grayValues[Math.floor(grayValues.length * 0.98)] ?? 255;
+  const gray: number[] = [];
+  for (let i = 0; i < data.length; i += 4)
+    gray.push(0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2]);
+  gray.sort((a, b) => a - b);
+  const p2 = gray[Math.floor(gray.length * 0.02)] ?? 0;
+  const p98 = gray[Math.floor(gray.length * 0.98)] ?? 255;
   const range = Math.max(p98 - p2, 1);
-
   for (let i = 0; i < data.length; i += 4) {
     data[i] = Math.min(
       255,
@@ -331,31 +341,24 @@ export async function preprocessImageForFace(
       Math.max(0, Math.round(((data[i + 2] - p2) / range) * 255)),
     );
   }
-
   const canvas = document.createElement("canvas");
   canvas.width = targetSize;
   canvas.height = targetSize;
-  const ctx = canvas.getContext("2d")!;
-  ctx.putImageData(imageData, 0, 0);
-
+  canvas.getContext("2d")!.putImageData(imageData, 0, 0);
   return loadHTMLImage(canvas.toDataURL("image/jpeg", 0.95));
 }
 
+// ─── Histogram helpers ────────────────────────────────────────────────────────
 export function extractHistogram(imageData: ImageData): number[] {
   const hist = new Array(BINS * 3).fill(0);
   const data = imageData.data;
-  const pixelCount = imageData.width * imageData.height;
-
+  const total = imageData.width * imageData.height;
   for (let i = 0; i < data.length; i += 4) {
-    const r = Math.floor((data[i] / 256) * BINS);
-    const g = Math.floor((data[i + 1] / 256) * BINS);
-    const b = Math.floor((data[i + 2] / 256) * BINS);
-    hist[r]++;
-    hist[BINS + g]++;
-    hist[BINS * 2 + b]++;
+    hist[Math.floor((data[i] / 256) * BINS)]++;
+    hist[BINS + Math.floor((data[i + 1] / 256) * BINS)]++;
+    hist[BINS * 2 + Math.floor((data[i + 2] / 256) * BINS)]++;
   }
-
-  return hist.map((v) => v / pixelCount);
+  return hist.map((v) => v / total);
 }
 
 export function histogramIntersection(h1: number[], h2: number[]): number {
@@ -368,164 +371,304 @@ export function histogramIntersection(h1: number[], h2: number[]): number {
   return sum > 0 ? intersection / sum : 0;
 }
 
+// ─── 5. Age Progression ───────────────────────────────────────────────────────
 /**
- * Apply pixel-level age progression transform.
- * Used only for UI preview display -- NOT used in CNN matching pipeline.
+ * Apply age progression / de-aging to an ImageData.
+ * ageFactor > 0 = age forward (child is older now than in registered photo)
+ * ageFactor < 0 = de-age (child is younger now)
+ * ageFactor = 0 = no change
  */
 export function applyAgeProgression(
   imageData: ImageData,
   ageFactor: number,
 ): ImageData {
-  const output = new ImageData(
+  const out = new ImageData(
     new Uint8ClampedArray(imageData.data),
     imageData.width,
     imageData.height,
   );
-  const data = output.data;
-
-  if (ageFactor >= 0) {
+  const d = out.data;
+  if (ageFactor > 0) {
+    // Forward aging: warm skin tone shift, slight texture contrast boost
     const rBoost = ageFactor * 20;
-    const gReduce = ageFactor * 8;
-    const brightness = ageFactor * 10;
-    for (let i = 0; i < data.length; i += 4) {
-      data[i] = Math.min(255, data[i] + rBoost + brightness * 0.3);
-      data[i + 1] = Math.min(
-        255,
-        Math.max(0, data[i + 1] - gReduce + brightness * 0.1),
+    const gDrop = ageFactor * 7;
+    for (let i = 0; i < d.length; i += 4) {
+      d[i] = Math.min(255, d[i] + rBoost);
+      d[i + 1] = Math.min(255, Math.max(0, d[i + 1] - gDrop));
+      // Contrast bump
+      d[i] = Math.round(Math.min(255, Math.max(0, (d[i] - 128) * 1.05 + 128)));
+      d[i + 1] = Math.round(
+        Math.min(255, Math.max(0, (d[i + 1] - 128) * 1.05 + 128)),
       );
-      data[i + 2] = Math.min(255, data[i + 2] + brightness * 0.1);
-      data[i] = Math.round(data[i] * 0.95 + 12);
-      data[i + 1] = Math.round(data[i + 1] * 0.95 + 12);
-      data[i + 2] = Math.round(data[i + 2] * 0.95 + 12);
+      d[i + 2] = Math.round(
+        Math.min(255, Math.max(0, (d[i + 2] - 128) * 1.05 + 128)),
+      );
     }
-  } else {
-    const factor = Math.abs(ageFactor);
-    const bBoost = factor * 12;
-    const rReduce = factor * 8;
-    for (let i = 0; i < data.length; i += 4) {
-      data[i] = Math.min(255, Math.max(0, data[i] - rReduce));
-      data[i + 1] = Math.min(255, data[i + 1] + bBoost * 0.2);
-      data[i + 2] = Math.min(255, data[i + 2] + bBoost);
-      data[i] = Math.round(
-        Math.min(255, Math.max(0, (data[i] - 128) * 1.08 + 128)),
+  } else if (ageFactor < 0) {
+    // De-aging: cooler tone, reduced contrast
+    const f = Math.abs(ageFactor);
+    const bBoost = f * 12;
+    const rDrop = f * 8;
+    for (let i = 0; i < d.length; i += 4) {
+      d[i] = Math.min(255, Math.max(0, d[i] - rDrop));
+      d[i + 2] = Math.min(255, d[i + 2] + bBoost);
+      d[i] = Math.round(Math.min(255, Math.max(0, (d[i] - 128) * 0.96 + 128)));
+      d[i + 1] = Math.round(
+        Math.min(255, Math.max(0, (d[i + 1] - 128) * 0.96 + 128)),
       );
-      data[i + 1] = Math.round(
-        Math.min(255, Math.max(0, (data[i + 1] - 128) * 1.08 + 128)),
-      );
-      data[i + 2] = Math.round(
-        Math.min(255, Math.max(0, (data[i + 2] - 128) * 1.08 + 128)),
+      d[i + 2] = Math.round(
+        Math.min(255, Math.max(0, (d[i + 2] - 128) * 0.96 + 128)),
       );
     }
   }
-
-  return output;
+  return out;
 }
 
-function imageDataToDataUrl(imageData: ImageData): string {
-  const canvas = document.createElement("canvas");
-  canvas.width = imageData.width;
-  canvas.height = imageData.height;
-  const ctx = canvas.getContext("2d");
-  if (!ctx) return "";
-  ctx.putImageData(imageData, 0, 0);
-  return canvas.toDataURL("image/jpeg", 0.9);
+function imageDataToDataUrl(id: ImageData): string {
+  const c = document.createElement("canvas");
+  c.width = id.width;
+  c.height = id.height;
+  c.getContext("2d")!.putImageData(id, 0, 0);
+  return c.toDataURL("image/jpeg", 0.9);
 }
 
-/**
- * Distance to score (tightened to 0.45 cutoff):
- * <= 0.30 → 90-100  (very high confidence -- same person)
- * <= 0.38 → 70-89   (likely match)
- * <= 0.45 → 40-69   (possible match)
- * > 0.45  → 0       (different person -- do not show)
- */
-function distanceToScore(distance: number): number {
-  if (distance <= 0.3) return Math.round(90 + ((0.3 - distance) / 0.3) * 10);
-  if (distance <= 0.38) return Math.round(70 + ((0.38 - distance) / 0.08) * 20);
-  if (distance <= 0.45) return Math.round(40 + ((0.45 - distance) / 0.07) * 30);
-  return 0; // distance > 0.45 = different person, do not show
+// ─── YOLOv8 face detection ────────────────────────────────────────────────────
+interface FaceBox {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+  conf: number;
 }
 
 /**
- * Facial landmark geometry descriptor:
- * 68 points normalized to the bounding box of the face.
- * Computes pairwise distances between key structural points:
- *   jaw, eyebrows, nose bridge, nose tip, eye corners, mouth corners.
- * Returns a normalized feature vector capturing face proportions.
+ * Run YOLOv8 ONNX face detection on an image element.
+ * Returns the best (largest) bounding box found, or null.
  */
-function landmarkGeometryDescriptor(
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  landmarks: any,
-): Float32Array | null {
+async function detectFaceYolov8(
+  imgEl: HTMLImageElement,
+): Promise<FaceBox | null> {
+  if (!yolov8Session) return null;
+  try {
+    const tf = window.tf;
+    const ort = window.ort;
+    if (!tf || !ort) return null;
+
+    const INPUT_SIZE = 640;
+    const canvas = document.createElement("canvas");
+    canvas.width = INPUT_SIZE;
+    canvas.height = INPUT_SIZE;
+    canvas.getContext("2d")!.drawImage(imgEl, 0, 0, INPUT_SIZE, INPUT_SIZE);
+
+    // Build Float32 tensor [1, 3, 640, 640] normalised to [0, 1]
+    const imageData = canvas
+      .getContext("2d")!
+      .getImageData(0, 0, INPUT_SIZE, INPUT_SIZE);
+    const inputArray = new Float32Array(1 * 3 * INPUT_SIZE * INPUT_SIZE);
+    for (let y = 0; y < INPUT_SIZE; y++) {
+      for (let x = 0; x < INPUT_SIZE; x++) {
+        const idx = (y * INPUT_SIZE + x) * 4;
+        const pixel = y * INPUT_SIZE + x;
+        inputArray[pixel] = imageData.data[idx] / 255; // R
+        inputArray[INPUT_SIZE * INPUT_SIZE + pixel] =
+          imageData.data[idx + 1] / 255; // G
+        inputArray[2 * INPUT_SIZE * INPUT_SIZE + pixel] =
+          imageData.data[idx + 2] / 255; // B
+      }
+    }
+
+    const inputTensor = new ort.Tensor("float32", inputArray, [
+      1,
+      3,
+      INPUT_SIZE,
+      INPUT_SIZE,
+    ]);
+    const feeds: Record<string, unknown> = {};
+    feeds[yolov8Session.inputNames[0]] = inputTensor;
+    const results = await yolov8Session.run(feeds);
+    const output = results[yolov8Session.outputNames[0]];
+    if (!output) return null;
+
+    // YOLOv8 output: [1, 5, num_anchors] (x, y, w, h, conf) or [1, num_anchors, 5]
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const data = output.data as Float32Array;
+    const dims = output.dims as number[];
+
+    let bestBox: FaceBox | null = null;
+    const scaleX = imgEl.naturalWidth / INPUT_SIZE;
+    const scaleY = imgEl.naturalHeight / INPUT_SIZE;
+
+    // Handle both [1, 5, N] and [1, N, 5] layouts
+    const isChannelFirst = dims[1] === 5;
+    const numDetections = isChannelFirst ? dims[2] : dims[1];
+
+    for (let i = 0; i < numDetections; i++) {
+      let cx: number;
+      let cy: number;
+      let w: number;
+      let h: number;
+      let conf: number;
+      if (isChannelFirst) {
+        cx = data[0 * numDetections + i];
+        cy = data[1 * numDetections + i];
+        w = data[2 * numDetections + i];
+        h = data[3 * numDetections + i];
+        conf = data[4 * numDetections + i];
+      } else {
+        cx = data[i * 5 + 0];
+        cy = data[i * 5 + 1];
+        w = data[i * 5 + 2];
+        h = data[i * 5 + 3];
+        conf = data[i * 5 + 4];
+      }
+      if (conf < 0.4) continue;
+      const box: FaceBox = {
+        x: (cx - w / 2) * scaleX,
+        y: (cy - h / 2) * scaleY,
+        w: w * scaleX,
+        h: h * scaleY,
+        conf,
+      };
+      if (!bestBox || box.w * box.h > bestBox.w * bestBox.h) bestBox = box;
+    }
+    return bestBox;
+  } catch {
+    return null;
+  }
+}
+
+// ─── BlazeFace face crop ──────────────────────────────────────────────────────
+async function cropFaceBlazeFace(
+  imgEl: HTMLImageElement,
+): Promise<HTMLImageElement | null> {
+  if (!blazefaceModel) await initBlazeFace();
+  if (!blazefaceModel) return null;
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const preds = await (blazefaceModel as any).estimateFaces(imgEl, false);
+    if (!preds || preds.length === 0) return null;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const best = preds.reduce((a: any, b: any) =>
+      (b.bottomRight[0] - b.topLeft[0]) * (b.bottomRight[1] - b.topLeft[1]) >
+      (a.bottomRight[0] - a.topLeft[0]) * (a.bottomRight[1] - a.topLeft[1])
+        ? b
+        : a,
+    );
+    const x1 = best.topLeft[0] as number;
+    const y1 = best.topLeft[1] as number;
+    const x2 = best.bottomRight[0] as number;
+    const y2 = best.bottomRight[1] as number;
+    const w = x2 - x1;
+    const h = y2 - y1;
+    const pad = 0.25;
+    const cx = Math.max(0, x1 - w * pad);
+    const cy = Math.max(0, y1 - h * pad);
+    const cw = Math.min(imgEl.naturalWidth - cx, w * (1 + 2 * pad));
+    const ch = Math.min(imgEl.naturalHeight - cy, h * (1 + 2 * pad));
+    if (cw < 20 || ch < 20) return null;
+    const canvas = document.createElement("canvas");
+    canvas.width = 512;
+    canvas.height = 512;
+    canvas.getContext("2d")!.drawImage(imgEl, cx, cy, cw, ch, 0, 0, 512, 512);
+    return loadHTMLImage(canvas.toDataURL("image/jpeg", 0.95));
+  } catch {
+    return null;
+  }
+}
+
+// ─── YOLOv8 face crop ────────────────────────────────────────────────────────
+async function cropFaceYolov8(
+  imgEl: HTMLImageElement,
+): Promise<HTMLImageElement | null> {
+  if (!yolov8Session) await initYolov8();
+  const box = await detectFaceYolov8(imgEl);
+  if (!box) return null;
+  try {
+    const pad = 0.2;
+    const cx = Math.max(0, box.x - box.w * pad);
+    const cy = Math.max(0, box.y - box.h * pad);
+    const cw = Math.min(imgEl.naturalWidth - cx, box.w * (1 + 2 * pad));
+    const ch = Math.min(imgEl.naturalHeight - cy, box.h * (1 + 2 * pad));
+    if (cw < 20 || ch < 20) return null;
+    const canvas = document.createElement("canvas");
+    canvas.width = 512;
+    canvas.height = 512;
+    canvas.getContext("2d")!.drawImage(imgEl, cx, cy, cw, ch, 0, 0, 512, 512);
+    return loadHTMLImage(canvas.toDataURL("image/jpeg", 0.95));
+  } catch {
+    return null;
+  }
+}
+
+// ─── ResNet50 feature extraction ──────────────────────────────────────────────
+async function extractResNet50Embedding(
+  imgEl: HTMLImageElement,
+): Promise<Float32Array | null> {
+  if (!resnet50Model) await initResNet50();
+  if (!resnet50Model) return null;
+  try {
+    const tf = window.tf;
+    if (!tf) return null;
+    const embedding = tf.tidy(() => {
+      const raw = tf.browser.fromPixels(imgEl);
+      const resized = tf.image.resizeBilinear(raw, [224, 224]);
+      const norm = resized
+        .toFloat()
+        .div(255.0)
+        .sub([0.485, 0.456, 0.406])
+        .div([0.229, 0.224, 0.225]);
+      const batched = norm.expandDims(0);
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const output = (resnet50Model as any).predict
+        ? (resnet50Model as any).predict(batched)
+        : (resnet50Model as any).execute(batched);
+      // Flatten & global average pool if needed
+      if (output.shape.length === 4) return output.mean([1, 2]).squeeze();
+      return output.squeeze();
+    });
+    const data = (await embedding.data()) as Float32Array;
+    embedding.dispose();
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+function cosineDistance(a: Float32Array, b: Float32Array): number {
+  if (a.length !== b.length) return 1;
+  let dot = 0;
+  let nA = 0;
+  let nB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    nA += a[i] * a[i];
+    nB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(nA) * Math.sqrt(nB);
+  return denom === 0 ? 1 : 1 - dot / denom;
+}
+
+// ─── face-api.js landmark geometry ───────────────────────────────────────────
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function landmarkGeometryDescriptor(landmarks: any): Float32Array | null {
   try {
     const pts = landmarks.positions as { x: number; y: number }[];
     if (!pts || pts.length < 68) return null;
-
-    // Key landmark indices (face-api 68-point model):
-    // Jaw: 0-16, left brow: 17-21, right brow: 22-26
-    // Nose bridge: 27-30, nose base: 31-35
-    // Left eye: 36-41, right eye: 42-47
-    // Mouth outer: 48-59, mouth inner: 60-67
-    const keyIndices = [
-      0,
-      4,
-      8,
-      12,
-      16, // jaw outline (5 pts)
-      17,
-      19,
-      21, // left brow
-      22,
-      24,
-      26, // right brow
-      27,
-      28,
-      29,
-      30, // nose bridge
-      31,
-      33,
-      35, // nose base
-      36,
-      37,
-      38,
-      39,
-      40,
-      41, // left eye (all 6)
-      42,
-      43,
-      44,
-      45,
-      46,
-      47, // right eye (all 6)
-      48,
-      50,
-      52,
-      54,
-      56,
-      58, // mouth outer (every other)
-      60,
-      62,
-      64,
-      66, // mouth inner
+    const keyIdx = [
+      0, 4, 8, 12, 16, 17, 19, 21, 22, 24, 26, 27, 28, 29, 30, 31, 33, 35, 36,
+      37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 50, 52, 54, 56, 58, 60,
+      62, 64, 66,
     ];
-
-    const keyPts = keyIndices.map((i) => pts[i]);
-
-    // Normalize to bounding box
-    const xs = keyPts.map((p) => p.x);
-    const ys = keyPts.map((p) => p.y);
+    const kp = keyIdx.map((i) => pts[i]);
+    const xs = kp.map((p) => p.x);
+    const ys = kp.map((p) => p.y);
     const minX = Math.min(...xs);
     const maxX = Math.max(...xs);
     const minY = Math.min(...ys);
     const maxY = Math.max(...ys);
     const W = Math.max(maxX - minX, 1);
     const H = Math.max(maxY - minY, 1);
-
-    const norm = keyPts.map((p) => ({
-      x: (p.x - minX) / W,
-      y: (p.y - minY) / H,
-    }));
-
-    // Build a feature vector: normalized x,y for all key points
+    const norm = kp.map((p) => ({ x: (p.x - minX) / W, y: (p.y - minY) / H }));
     const vec = new Float32Array(norm.length * 2);
     for (let i = 0; i < norm.length; i++) {
       vec[i * 2] = norm[i].x;
@@ -544,223 +687,7 @@ function landmarkDistance(a: Float32Array, b: Float32Array): number {
     const d = a[i] - b[i];
     sum += d * d;
   }
-  return Math.sqrt(sum / a.length); // RMSE per dimension
-}
-
-/**
- * Full face analysis result with CNN descriptor + landmark geometry.
- */
-interface FaceAnalysis {
-  descriptor: Float32Array;
-  landmarkDesc: Float32Array | null;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  detection: any;
-}
-
-/**
- * Try to extract face analysis using all available strategies.
- * Strategies ordered by quality: best resolution first, most permissive last.
- * Uses detectAllFaces for each strategy to catch faces missed by detectSingleFace.
- * Strategies 8 & 9 use BlazeFace to crop the face region first for higher accuracy.
- */
-async function extractFullFaceAnalysis(
-  imgEl: HTMLImageElement,
-): Promise<FaceAnalysis | null> {
-  const api = getFaceApi();
-  if (!api) return null;
-
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
-  const tryDetectBest = async (options: any): Promise<FaceAnalysis | null> => {
-    try {
-      // First: try detectAllFaces and pick the largest/best-score detection
-      const allDetections = await api
-        .detectAllFaces(imgEl, options)
-        .withFaceLandmarks()
-        .withFaceDescriptors();
-
-      if (allDetections && allDetections.length > 0) {
-        // Pick the detection with the largest bounding box (most prominent face)
-        const best = allDetections.reduce(
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          (prev: any, curr: any) => {
-            const prevArea =
-              (prev.detection?.box?.width ?? 0) *
-              (prev.detection?.box?.height ?? 0);
-            const currArea =
-              (curr.detection?.box?.width ?? 0) *
-              (curr.detection?.box?.height ?? 0);
-            return currArea > prevArea ? curr : prev;
-          },
-          allDetections[0],
-        );
-        if (best?.descriptor) {
-          return {
-            descriptor: best.descriptor,
-            landmarkDesc: best.landmarks
-              ? landmarkGeometryDescriptor(best.landmarks)
-              : null,
-            detection: best.detection,
-          };
-        }
-      }
-
-      // Fallback to detectSingleFace
-      const single = await api
-        .detectSingleFace(imgEl, options)
-        .withFaceLandmarks()
-        .withFaceDescriptor();
-      if (single?.descriptor) {
-        return {
-          descriptor: single.descriptor,
-          landmarkDesc: single.landmarks
-            ? landmarkGeometryDescriptor(single.landmarks)
-            : null,
-          detection: single.detection,
-        };
-      }
-    } catch {
-      // continue to next strategy
-    }
-    return null;
-  };
-
-  const strategies = [
-    // 1. SsdMobilenetv1 at high confidence on full-res image (best quality)
-    () => tryDetectBest(new api.SsdMobilenetv1Options({ minConfidence: 0.5 })),
-    // 2. SsdMobilenetv1 at medium confidence
-    () => tryDetectBest(new api.SsdMobilenetv1Options({ minConfidence: 0.3 })),
-    // 3. TinyFaceDetector at 512px (good balance of speed/accuracy)
-    () =>
-      tryDetectBest(
-        new api.TinyFaceDetectorOptions({
-          inputSize: 512,
-          scoreThreshold: 0.4,
-        }),
-      ),
-    // 4. TinyFaceDetector at 416px
-    () =>
-      tryDetectBest(
-        new api.TinyFaceDetectorOptions({
-          inputSize: 416,
-          scoreThreshold: 0.35,
-        }),
-      ),
-    // 5. SsdMobilenetv1 at low confidence (catches partial/angled faces)
-    () => tryDetectBest(new api.SsdMobilenetv1Options({ minConfidence: 0.15 })),
-    // 6. TinyFaceDetector at 608px (large input for small faces)
-    () =>
-      tryDetectBest(
-        new api.TinyFaceDetectorOptions({
-          inputSize: 608,
-          scoreThreshold: 0.25,
-        }),
-      ),
-    // 7. SsdMobilenetv1 at very low threshold (last resort)
-    () => tryDetectBest(new api.SsdMobilenetv1Options({ minConfidence: 0.05 })),
-  ];
-
-  for (const strategy of strategies) {
-    const result = await strategy();
-    if (result) return result;
-  }
-
-  // Strategy 8 & 9: BlazeFace crop -- detect face region first, then run face-api.js on crop
-  const cropResult = await cropFaceWithBlazeFace(imgEl);
-  if (cropResult) {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const tryDetectOnCrop = async (
-      options: any,
-    ): Promise<FaceAnalysis | null> => {
-      try {
-        const allDetections = await api
-          .detectAllFaces(cropResult, options)
-          .withFaceLandmarks()
-          .withFaceDescriptors();
-        if (allDetections && allDetections.length > 0) {
-          // eslint-disable-next-line @typescript-eslint/no-explicit-any
-          const best = allDetections.reduce((prev: any, curr: any) => {
-            const prevArea =
-              (prev.detection?.box?.width ?? 0) *
-              (prev.detection?.box?.height ?? 0);
-            const currArea =
-              (curr.detection?.box?.width ?? 0) *
-              (curr.detection?.box?.height ?? 0);
-            return currArea > prevArea ? curr : prev;
-          }, allDetections[0]);
-          if (best?.descriptor) {
-            return {
-              descriptor: best.descriptor,
-              landmarkDesc: best.landmarks
-                ? landmarkGeometryDescriptor(best.landmarks)
-                : null,
-              detection: best.detection,
-            };
-          }
-        }
-        const single = await api
-          .detectSingleFace(cropResult, options)
-          .withFaceLandmarks()
-          .withFaceDescriptor();
-        if (single?.descriptor) {
-          return {
-            descriptor: single.descriptor,
-            landmarkDesc: single.landmarks
-              ? landmarkGeometryDescriptor(single.landmarks)
-              : null,
-            detection: single.detection,
-          };
-        }
-      } catch {
-        // continue
-      }
-      return null;
-    };
-
-    // Strategy 8: BlazeFace crop + SsdMobilenetv1
-    const r8 = await tryDetectOnCrop(
-      new api.SsdMobilenetv1Options({ minConfidence: 0.3 }),
-    );
-    if (r8) return r8;
-
-    // Strategy 9: BlazeFace crop + TinyFaceDetector at 512px
-    const r9 = await tryDetectOnCrop(
-      new api.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.3 }),
-    );
-    if (r9) return r9;
-  }
-
-  return null;
-}
-
-/**
- * Detect whether a face is present (used for live camera indicator).
- */
-export async function detectFaceInImage(
-  imgEl: HTMLImageElement,
-): Promise<boolean> {
-  const api = getFaceApi();
-  if (!api) return false;
-  try {
-    // detectAllFaces for robustness
-    const all = await api
-      .detectAllFaces(
-        imgEl,
-        new api.TinyFaceDetectorOptions({
-          inputSize: 416,
-          scoreThreshold: 0.3,
-        }),
-      )
-      .run();
-    if (all && all.length > 0) return true;
-
-    const d = await api.detectSingleFace(
-      imgEl,
-      new api.SsdMobilenetv1Options({ minConfidence: 0.2 }),
-    );
-    return !!d;
-  } catch {
-    return false;
-  }
+  return Math.sqrt(sum / a.length);
 }
 
 function descriptorDistance(a: Float32Array, b: Float32Array): number {
@@ -772,45 +699,241 @@ function descriptorDistance(a: Float32Array, b: Float32Array): number {
   return Math.sqrt(sum);
 }
 
+// ─── face-api.js full analysis ────────────────────────────────────────────────
+interface FaceAnalysis {
+  descriptor: Float32Array;
+  landmarkDesc: Float32Array | null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  detection: any;
+}
+
+async function extractFaceApiAnalysis(
+  imgEl: HTMLImageElement,
+): Promise<FaceAnalysis | null> {
+  const api = getFaceApi();
+  if (!api) return null;
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const tryDetect = async (
+    opts: any,
+    src?: HTMLImageElement,
+  ): Promise<FaceAnalysis | null> => {
+    const img = src ?? imgEl;
+    try {
+      const all = await api
+        .detectAllFaces(img, opts)
+        .withFaceLandmarks()
+        .withFaceDescriptors();
+      if (all && all.length > 0) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const best = all.reduce(
+          (p: any, c: any) =>
+            (c.detection?.box?.width ?? 0) * (c.detection?.box?.height ?? 0) >
+            (p.detection?.box?.width ?? 0) * (p.detection?.box?.height ?? 0)
+              ? c
+              : p,
+          all[0],
+        );
+        if (best?.descriptor)
+          return {
+            descriptor: best.descriptor,
+            landmarkDesc: best.landmarks
+              ? landmarkGeometryDescriptor(best.landmarks)
+              : null,
+            detection: best.detection,
+          };
+      }
+    } catch {
+      /* fall through */
+    }
+    try {
+      const single = await api
+        .detectSingleFace(imgEl, opts)
+        .withFaceLandmarks()
+        .withFaceDescriptor();
+      if (single?.descriptor)
+        return {
+          descriptor: single.descriptor,
+          landmarkDesc: single.landmarks
+            ? landmarkGeometryDescriptor(single.landmarks)
+            : null,
+          detection: single.detection,
+        };
+    } catch {
+      /* fall through */
+    }
+    return null;
+  };
+
+  // Detection strategies using face-api.js
+  const strategies = [
+    () => tryDetect(new api.SsdMobilenetv1Options({ minConfidence: 0.5 })),
+    () =>
+      tryDetect(
+        new api.TinyFaceDetectorOptions({
+          inputSize: 512,
+          scoreThreshold: 0.4,
+        }),
+      ),
+    () => tryDetect(new api.SsdMobilenetv1Options({ minConfidence: 0.3 })),
+    () =>
+      tryDetect(
+        new api.TinyFaceDetectorOptions({
+          inputSize: 416,
+          scoreThreshold: 0.35,
+        }),
+      ),
+    () => tryDetect(new api.SsdMobilenetv1Options({ minConfidence: 0.15 })),
+    () =>
+      tryDetect(
+        new api.TinyFaceDetectorOptions({
+          inputSize: 608,
+          scoreThreshold: 0.25,
+        }),
+      ),
+    () => tryDetect(new api.SsdMobilenetv1Options({ minConfidence: 0.05 })),
+  ];
+
+  for (const s of strategies) {
+    const r = await s();
+    if (r) return r;
+  }
+
+  // BlazeFace crop → face-api.js
+  const blazeCrop = await cropFaceBlazeFace(imgEl);
+  if (blazeCrop) {
+    for (const opts of [
+      new api.SsdMobilenetv1Options({ minConfidence: 0.3 }),
+      new api.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.3 }),
+    ]) {
+      const r = await tryDetect(opts, blazeCrop);
+      if (r) return r;
+    }
+  }
+
+  // YOLOv8 crop → face-api.js
+  const yoloCrop = await cropFaceYolov8(imgEl);
+  if (yoloCrop) {
+    for (const opts of [
+      new api.SsdMobilenetv1Options({ minConfidence: 0.3 }),
+      new api.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.3 }),
+    ]) {
+      const r = await tryDetect(opts, yoloCrop);
+      if (r) return r;
+    }
+  }
+
+  return null;
+}
+
+export async function detectFaceInImage(
+  imgEl: HTMLImageElement,
+): Promise<boolean> {
+  const api = getFaceApi();
+  if (!api) return false;
+  try {
+    const all = await api
+      .detectAllFaces(
+        imgEl,
+        new api.TinyFaceDetectorOptions({
+          inputSize: 416,
+          scoreThreshold: 0.3,
+        }),
+      )
+      .run();
+    if (all && all.length > 0) return true;
+    const d = await api.detectSingleFace(
+      imgEl,
+      new api.SsdMobilenetv1Options({ minConfidence: 0.2 }),
+    );
+    return !!d;
+  } catch {
+    return false;
+  }
+}
+
+// ─── Score conversion ─────────────────────────────────────────────────────────
+function distanceToScore(distance: number, cap55 = false): number {
+  if (distance <= 0.2) return cap55 ? 55 : 100;
+  if (distance <= 0.3)
+    return cap55 ? 55 : Math.round(90 + ((0.3 - distance) / 0.1) * 10);
+  if (distance <= 0.45)
+    return cap55 ? 55 : Math.round(75 + ((0.45 - distance) / 0.15) * 15);
+  if (distance <= 0.55)
+    return cap55 ? 55 : Math.round(65 + ((0.55 - distance) / 0.1) * 10);
+  if (distance <= 0.65)
+    return cap55 ? 55 : Math.round(58 + ((0.65 - distance) / 0.1) * 7);
+  if (distance <= CNN_MATCH_THRESHOLD)
+    return Math.round(
+      50 +
+        ((CNN_MATCH_THRESHOLD - distance) / (CNN_MATCH_THRESHOLD - 0.65)) * 8,
+    );
+  return 0;
+}
+
+// ─── Core match engine ────────────────────────────────────────────────────────
 /**
- * Comprehensive face match score:
- * - CNN 128-dim descriptor distance (primary signal, 100% weight when CNN dist >= 0.40)
- * - 68-point landmark geometry distance (secondary signal, only when CNN dist < 0.40)
- *   Blend: 80% CNN + 20% landmark when landmarks available AND cnnDist < 0.40
- * - Age progression is NOT applied here -- it distorts 128-dim CNN descriptor spaces
- *   and causes false positives. Age progression is used only for UI preview.
- * Returns -1 if no face detected in either image.
+ * Signal pipeline (all 5 models):
+ * 1. face-api.js CNN (128-dim) — primary identity descriptor
+ * 2. face-api.js 68-point landmark geometry — structural face shape
+ * 3. ResNet50 (TF.js, 2048-dim) — deep visual identity signal
+ * 4. Age Progression — registered photo aged ±N before comparison
+ * 5. BlazeFace + YOLOv8-ONNX — used for face crop to improve all above signals
+ *
+ * Final weight: 55% CNN · 20% landmark · 25% ResNet50
+ * Only matches with CNN distance < 0.72 are returned; returns -1 otherwise.
  */
 async function cnnMatchScore(
   searchImg: HTMLImageElement,
   caseImg: HTMLImageElement,
 ): Promise<number> {
-  const [searchAnalysis, caseAnalysis] = await Promise.all([
-    extractFullFaceAnalysis(searchImg),
-    extractFullFaceAnalysis(caseImg),
+  const [searchFA, caseFA] = await Promise.all([
+    extractFaceApiAnalysis(searchImg),
+    extractFaceApiAnalysis(caseImg),
   ]);
 
-  if (!caseAnalysis || !searchAnalysis) return -1;
+  // ── Whole-image CNN fallback when face detection fails ─────────────────────
+  if (!searchFA || !caseFA) {
+    try {
+      const api = getFaceApi();
+      if (api) {
+        const resize = (img: HTMLImageElement) => {
+          const c = document.createElement("canvas");
+          c.width = 224;
+          c.height = 224;
+          c.getContext("2d")!.drawImage(img, 0, 0, 224, 224);
+          return c;
+        };
+        const [dA, dB] = await Promise.all([
+          api.nets.faceRecognitionNet
+            .computeFaceDescriptor(resize(searchImg))
+            .catch(() => null),
+          api.nets.faceRecognitionNet
+            .computeFaceDescriptor(resize(caseImg))
+            .catch(() => null),
+        ]);
+        if (dA && dB) {
+          const dist = descriptorDistance(
+            dA instanceof Float32Array ? dA : new Float32Array(dA),
+            dB instanceof Float32Array ? dB : new Float32Array(dB),
+          );
+          if (dist < 0.65) return distanceToScore(dist, true);
+        }
+      }
+    } catch {
+      /* ignore */
+    }
+    return -1;
+  }
 
-  // -- CNN descriptor score (primary signal)
-  const cnnDist = descriptorDistance(
-    searchAnalysis.descriptor,
-    caseAnalysis.descriptor,
-  );
-  const baseCnnScore = distanceToScore(cnnDist);
+  const cnnDist = descriptorDistance(searchFA.descriptor, caseFA.descriptor);
+  if (cnnDist > CNN_MATCH_THRESHOLD) return -1;
 
-  // -- Landmark geometry score (secondary signal, only when CNN distance is already plausible)
-  // Only blend landmarks when cnnDist < 0.40 -- don't let landmarks rescue a bad CNN score.
-  if (
-    cnnDist < 0.4 &&
-    searchAnalysis.landmarkDesc &&
-    caseAnalysis.landmarkDesc
-  ) {
-    const lmDist = landmarkDistance(
-      searchAnalysis.landmarkDesc,
-      caseAnalysis.landmarkDesc,
-    );
-    // Landmark RMSE: <= 0.04 = excellent, <= 0.08 = good, > 0.15 = poor
+  let score = distanceToScore(cnnDist); // CNN score (base)
+
+  // ── Landmark geometry ──────────────────────────────────────────────────────
+  if (searchFA.landmarkDesc && caseFA.landmarkDesc) {
+    const lmDist = landmarkDistance(searchFA.landmarkDesc, caseFA.landmarkDesc);
     const lmScore =
       lmDist <= 0.04
         ? 95
@@ -821,15 +944,67 @@ async function cnnMatchScore(
             : lmDist <= 0.15
               ? Math.round(30 + ((0.15 - lmDist) / 0.05) * 25)
               : Math.max(0, Math.round(30 - ((lmDist - 0.15) / 0.15) * 30));
-
-    // Blend: 80% CNN + 20% landmark (reduced from 30% to prevent noise amplification)
-    return Math.round(baseCnnScore * 0.8 + lmScore * 0.2);
+    // 75% CNN + 25% landmark so far
+    score = Math.round(score * 0.75 + lmScore * 0.25);
   }
 
-  // No landmarks or CNN distance too large -- use CNN score only
-  return baseCnnScore;
+  // ── ResNet50 deep embedding ────────────────────────────────────────────────
+  try {
+    const [embA, embB] = await Promise.all([
+      extractResNet50Embedding(searchImg),
+      extractResNet50Embedding(caseImg),
+    ]);
+    if (embA && embB) {
+      const rDist = cosineDistance(embA, embB);
+      const rScore =
+        rDist <= 0.1
+          ? 95
+          : rDist <= 0.2
+            ? Math.round(75 + ((0.2 - rDist) / 0.1) * 20)
+            : rDist <= 0.35
+              ? Math.round(50 + ((0.35 - rDist) / 0.15) * 25)
+              : Math.round(Math.max(0, 50 - ((rDist - 0.35) / 0.35) * 50));
+      // Blend: 75% (CNN+landmark) + 25% ResNet50
+      score = Math.round(score * 0.75 + rScore * 0.25);
+    }
+  } catch {
+    /* ResNet50 is best-effort */
+  }
+
+  return Math.max(0, score);
 }
 
+// ─── Age-progression wrapper ──────────────────────────────────────────────────
+/**
+ * Run cnnMatchScore across multiple age-progression variants of the case photo.
+ * Returns the best (highest) score found.
+ * Age factors tested: 0 (original), +0.4, +0.8, +1.2, -0.4 (de-aged)
+ */
+async function matchWithAgeProgression(
+  searchImg: HTMLImageElement,
+  caseImgDataUrl: string,
+): Promise<number> {
+  const ageFactors = [0, 0.4, 0.8, 1.2, -0.4];
+  let bestScore = -1;
+
+  for (const factor of ageFactors) {
+    let caseImg: HTMLImageElement;
+    if (factor === 0) {
+      caseImg = await loadHTMLImage(caseImgDataUrl);
+    } else {
+      const imgData = await loadImageToCanvas(caseImgDataUrl, 320, 320);
+      const aged = applyAgeProgression(imgData, factor);
+      caseImg = await loadHTMLImage(imageDataToDataUrl(aged));
+    }
+    const score = await cnnMatchScore(searchImg, caseImg);
+    if (score > bestScore) bestScore = score;
+    if (bestScore >= 85) break; // early exit on high-confidence match
+  }
+
+  return bestScore;
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
 export async function computeMatchScore(
   searchSource: File | string,
   casePhotoUrl: string,
@@ -848,7 +1023,7 @@ export async function computeMatchScore(
       });
     }
 
-    // Age-progressed preview is for UI display only -- not used in matching
+    // UI age-progression preview
     if (onAgeProgressedDataUrl) {
       const imgData = await loadImageToCanvas(
         searchDataUrl,
@@ -859,52 +1034,65 @@ export async function computeMatchScore(
       onAgeProgressedDataUrl(imageDataToDataUrl(aged));
     }
 
-    if (modelsLoaded) {
-      // Load images at full natural size for best detection quality
-      const [searchImgNatural, caseImgNatural] = await Promise.all([
-        loadHTMLImageNatural(searchDataUrl),
-        loadHTMLImageNatural(casePhotoUrl),
-      ]);
+    if (faceApiLoaded) {
+      // Multi-pass preprocessing with age progression
+      const searchImgNatural = await loadHTMLImage(searchDataUrl);
 
-      const cnnScore = await cnnMatchScore(searchImgNatural, caseImgNatural);
+      // Pass 1: natural resolution + age progression
+      const score1 = await matchWithAgeProgression(
+        searchImgNatural,
+        casePhotoUrl,
+      );
+      if (score1 >= 0) return score1;
 
-      if (cnnScore >= 0) {
-        return Math.round(cnnScore);
-      }
-
-      // CNN got no face -- try preprocessed versions before giving up
-      const [searchPrep, casePrep] = await Promise.all([
+      // Pass 2: contrast-normalised 320px
+      const [searchPrep2] = await Promise.all([
         preprocessImageForFace(searchDataUrl, 320).catch(() =>
           loadHTMLImage(searchDataUrl),
         ),
-        preprocessImageForFace(casePhotoUrl, 320).catch(() =>
-          loadHTMLImage(casePhotoUrl),
-        ),
       ]);
-      const cnnScore2 = await cnnMatchScore(searchPrep, casePrep);
-      if (cnnScore2 >= 0) {
-        return Math.round(cnnScore2);
-      }
+      const score2 = await matchWithAgeProgression(searchPrep2, casePhotoUrl);
+      if (score2 >= 0) return score2;
 
-      // No face detected anywhere -- do NOT use histogram (causes wrong matches)
-      return 0;
+      // Pass 3: 640px
+      const searchPrep3 = await preprocessImageForFace(
+        searchDataUrl,
+        640,
+      ).catch(() => loadHTMLImage(searchDataUrl));
+      const score3 = await matchWithAgeProgression(searchPrep3, casePhotoUrl);
+      if (score3 >= 0) return score3;
+
+      // Pass 4: 960px
+      const searchPrep4 = await preprocessImageForFace(
+        searchDataUrl,
+        960,
+      ).catch(() => loadHTMLImage(searchDataUrl));
+      const score4 = await matchWithAgeProgression(searchPrep4, casePhotoUrl);
+      if (score4 >= 0) return score4;
+
+      // Pass 5: 160px side-profile
+      const searchPrep5 = await preprocessImageForFace(
+        searchDataUrl,
+        160,
+      ).catch(() => loadHTMLImage(searchDataUrl));
+      const score5 = await matchWithAgeProgression(searchPrep5, casePhotoUrl);
+      if (score5 >= 0) return score5;
+
+      return 0; // face not detected in any pass
     }
 
-    // Models not loaded -- plain histogram fallback only (no age variants to avoid false positives)
-    const [searchImageData, caseImageData] = await Promise.all([
+    // ── Fallback: histogram only (heavily discounted) ──────────────────────────
+    const [sd, cd] = await Promise.all([
       loadImageToCanvas(searchDataUrl),
       loadImageToCanvas(casePhotoUrl),
     ]);
-    const histRaw = histogramIntersection(
-      extractHistogram(searchImageData),
-      extractHistogram(caseImageData),
+    const raw = histogramIntersection(
+      extractHistogram(sd),
+      extractHistogram(cd),
     );
-    const rawScore = Math.max(
-      0,
-      Math.min(100, Math.round(((histRaw - 0.3) / 0.5) * 100)),
+    return Math.round(
+      Math.max(0, Math.min(100, Math.round(((raw - 0.3) / 0.5) * 100))) * 0.2,
     );
-    // Heavily discount histogram-only scores to avoid wrong matches
-    return Math.round(rawScore * 0.35);
   } catch {
     return 0;
   }
@@ -915,13 +1103,11 @@ export function computeFrameVariance(imageData: ImageData): number {
   let sum = 0;
   let sumSq = 0;
   const pixels = data.length / 4;
-
   for (let i = 0; i < data.length; i += 4) {
-    const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
-    sum += gray;
-    sumSq += gray * gray;
+    const g = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    sum += g;
+    sumSq += g * g;
   }
-
   const mean = sum / pixels;
   return sumSq / pixels - mean * mean;
 }

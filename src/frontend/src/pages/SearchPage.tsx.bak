@@ -1185,11 +1185,13 @@ export default function SearchPage() {
                 Best Match Found
               </h2>
 
-              {topMatch && topMatch.score < 40 && (
-                <Alert className="border-blue-500/30 bg-blue-500/5">
-                  <AlertDescription className="text-blue-700 dark:text-blue-400">
-                    <strong>Tip:</strong> For best matching accuracy, use a
-                    clear frontal photo with good lighting.
+              {topMatch && topMatch.score === 0 && (
+                <Alert className="border-amber-500/40 bg-amber-500/5">
+                  <AlertTriangle className="h-4 w-4 text-amber-600" />
+                  <AlertDescription>
+                    <strong>Face not detected</strong> in your photo. Showing
+                    the closest case by appearance. For best results, use a
+                    clear, well-lit frontal photo.
                   </AlertDescription>
                 </Alert>
               )}
@@ -1250,9 +1252,7 @@ export default function SearchPage() {
                             ? "✓ MATCH FOUND"
                             : result.score >= 40
                               ? "⚠ POSSIBLE MATCH"
-                              : result.score >= 1
-                                ? "~ LOW SIMILARITY"
-                                : "○ CLOSEST VISUAL MATCH"}
+                              : "? LOW CONFIDENCE"}
                         </div>
                       </div>
 
@@ -1276,9 +1276,7 @@ export default function SearchPage() {
                                   ? "High Confidence Match"
                                   : result.score >= 40
                                     ? "Possible Match"
-                                    : result.score >= 1
-                                      ? "Low Similarity"
-                                      : "Closest Visual Match"}
+                                    : "Face Not Detected — Closest Case"}
                               </span>
                             </div>
                             <p className="text-xs text-muted-foreground">

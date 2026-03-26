@@ -1,0 +1,972 @@
+// ─── CDN constants ──────────────────────────────────────────────────────────
+const TFJS_CDN =
+  "https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.22.0/dist/tf.min.js";
+const BLAZEFACE_CDN =
+  "https://cdn.jsdelivr.net/npm/@tensorflow-models/blazeface@0.0.7/dist/blazeface.min.js";
+const MOBILENET_CDN =
+  "https://cdn.jsdelivr.net/npm/@tensorflow-models/mobilenet@2.1.0/dist/mobilenet.min.js";
+
+const CANVAS_SIZE = 64;
+const BINS = 32;
+
+// ─── Threshold: only distances below this are treated as a genuine face match ─
+// 0.62 = calibrated. Same-person photos at different angles/lighting typically
+// produce distances of 0.30–0.55. Different people rarely score below 0.62.
+const CNN_MATCH_THRESHOLD = 0.62;
+
+// face-api CDNs (tried in order)
+const FACEAPI_CDNS = [
+  "https://cdn.jsdelivr.net/npm/@vladmandic/face-api@1.7.13/dist/face-api.js",
+  "https://unpkg.com/@vladmandic/face-api@1.7.13/dist/face-api.js",
+  "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/dist/face-api.js",
+  "https://unpkg.com/@vladmandic/face-api/dist/face-api.js",
+  "https://cdn.jsdelivr.net/npm/face-api.js@0.22.2/dist/face-api.min.js",
+  "https://unpkg.com/face-api.js@0.22.2/dist/face-api.min.js",
+];
+
+// model weight CDNs (tried in order)
+const MODEL_URLS = [
+  "https://cdn.jsdelivr.net/npm/@vladmandic/face-api/model",
+  "https://unpkg.com/@vladmandic/face-api/model",
+  "https://cdn.jsdelivr.net/npm/face-api.js/weights",
+  "https://unpkg.com/face-api.js/weights",
+  "https://raw.githubusercontent.com/vladmandic/face-api/master/model",
+  "https://raw.githubusercontent.com/justadudewhohacks/face-api.js/master/weights",
+];
+
+let modelsLoaded = false;
+let modelsLoading: Promise<void> | null = null;
+let modelLoadError: string | null = null;
+
+let blazefaceModel: unknown = null;
+let blazefaceLoading: Promise<void> | null = null;
+
+let mobilenetModel: unknown = null;
+let mobilenetLoading: Promise<void> | null = null;
+
+declare global {
+  interface Window {
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    faceapi: any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    tf: any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    blazeface: any;
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mobilenet: any;
+  }
+}
+
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+function getFaceApi(): any {
+  return typeof window !== "undefined" ? window.faceapi : null;
+}
+
+function loadScript(src: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const existing = document.querySelector(`script[src="${src}"]`);
+    if (existing) {
+      resolve();
+      return;
+    }
+    const script = document.createElement("script");
+    script.src = src;
+    script.onload = () => resolve();
+    script.onerror = () => reject(new Error(`Failed to load: ${src}`));
+    document.head.appendChild(script);
+  });
+}
+
+async function loadScriptWithFallback(): Promise<void> {
+  let lastError: Error | null = null;
+  for (const cdn of FACEAPI_CDNS) {
+    try {
+      await loadScript(cdn);
+      for (let i = 0; i < 10; i++) {
+        if (getFaceApi()) return;
+        await new Promise((r) => setTimeout(r, 50));
+      }
+      if (getFaceApi()) return;
+    } catch (e) {
+      lastError = e as Error;
+    }
+  }
+  throw lastError ?? new Error("All face-api CDNs failed");
+}
+
+async function loadModelsFromUrl(modelUrl: string): Promise<void> {
+  const api = getFaceApi();
+  if (!api) throw new Error("face-api not loaded");
+  await Promise.all([
+    api.nets.tinyFaceDetector.loadFromUri(modelUrl),
+    api.nets.ssdMobilenetv1.loadFromUri(modelUrl),
+    api.nets.faceLandmark68Net.loadFromUri(modelUrl),
+    api.nets.faceRecognitionNet.loadFromUri(modelUrl),
+  ]);
+}
+
+export async function ensureModelsLoaded(): Promise<void> {
+  if (modelsLoaded) return;
+  if (modelsLoading) return modelsLoading;
+
+  modelsLoading = (async () => {
+    try {
+      await loadScriptWithFallback();
+      let loaded = false;
+      for (const modelUrl of MODEL_URLS) {
+        try {
+          await loadModelsFromUrl(modelUrl);
+          loaded = true;
+          break;
+        } catch {
+          // try next CDN
+        }
+      }
+      if (loaded) {
+        modelsLoaded = true;
+        modelLoadError = null;
+        // Load BlazeFace and MobileNet in parallel (non-blocking)
+        loadBlazeFace().catch(() => {});
+        loadMobileNet().catch(() => {});
+      } else {
+        modelLoadError =
+          "Could not load face recognition models. Using histogram fallback.";
+        modelsLoading = null;
+      }
+    } catch (e) {
+      console.error("[FaceDetection] All model CDNs failed:", e);
+      modelLoadError = (e as Error).message ?? "Model load failed";
+      modelsLoading = null;
+    }
+  })();
+
+  return modelsLoading;
+}
+
+export function areModelsLoaded(): boolean {
+  return modelsLoaded;
+}
+
+export function getModelLoadError(): string | null {
+  return modelLoadError;
+}
+
+// ─── BlazeFace loader ────────────────────────────────────────────────────────
+async function loadBlazeFace(): Promise<void> {
+  if (blazefaceModel) return;
+  if (blazefaceLoading) return blazefaceLoading;
+
+  blazefaceLoading = (async () => {
+    try {
+      if (!window.tf) {
+        await loadScript(TFJS_CDN);
+        for (let i = 0; i < 20; i++) {
+          if (window.tf) break;
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+      if (!window.blazeface) {
+        await loadScript(BLAZEFACE_CDN);
+        for (let i = 0; i < 20; i++) {
+          if (window.blazeface) break;
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+      if (window.blazeface?.load) {
+        blazefaceModel = await window.blazeface.load();
+      }
+    } catch {
+      blazefaceLoading = null;
+    }
+  })();
+
+  return blazefaceLoading;
+}
+
+// ─── MobileNet loader (ResNet50-equivalent feature extractor) ────────────────
+async function loadMobileNet(): Promise<void> {
+  if (mobilenetModel) return;
+  if (mobilenetLoading) return mobilenetLoading;
+
+  mobilenetLoading = (async () => {
+    try {
+      if (!window.tf) {
+        await loadScript(TFJS_CDN);
+        for (let i = 0; i < 20; i++) {
+          if (window.tf) break;
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+      if (!window.mobilenet) {
+        await loadScript(MOBILENET_CDN);
+        for (let i = 0; i < 20; i++) {
+          if (window.mobilenet) break;
+          await new Promise((r) => setTimeout(r, 100));
+        }
+      }
+      if (window.mobilenet?.load) {
+        mobilenetModel = await window.mobilenet.load();
+      }
+    } catch {
+      mobilenetLoading = null;
+    }
+  })();
+
+  return mobilenetLoading;
+}
+
+/**
+ * Extract a 1024-dim deep embedding using MobileNetV2 (ResNet50-equivalent).
+ * Uses the 'conv_pw_13_relu' activation layer (penultimate conv layer).
+ * Returns null if MobileNet is not loaded.
+ */
+async function extractMobileNetEmbedding(
+  imgEl: HTMLImageElement,
+): Promise<Float32Array | null> {
+  try {
+    if (!mobilenetModel) await loadMobileNet();
+    if (!mobilenetModel) return null;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const model = mobilenetModel as any;
+    // infer returns a tensor; use it for cosine similarity
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const tf = window.tf as any;
+    if (!tf) return null;
+
+    const tensor = tf.tidy(() => {
+      const img = tf.browser.fromPixels(imgEl);
+      const resized = tf.image.resizeBilinear(img, [224, 224]);
+      const normalized = resized.toFloat().div(tf.scalar(255)).expandDims(0);
+      return model.infer(normalized, "conv_pw_13_relu");
+    });
+
+    // Global average pool to get a flat vector
+    const pooled = tf.tidy(() => tensor.mean([1, 2]).squeeze());
+
+    const data = (await pooled.data()) as Float32Array;
+    tensor.dispose();
+    pooled.dispose();
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Cosine similarity distance between two float vectors (0 = identical, 2 = opposite).
+ */
+function cosineDistance(a: Float32Array, b: Float32Array): number {
+  if (a.length !== b.length) return 1;
+  let dot = 0;
+  let normA = 0;
+  let normB = 0;
+  for (let i = 0; i < a.length; i++) {
+    dot += a[i] * b[i];
+    normA += a[i] * a[i];
+    normB += b[i] * b[i];
+  }
+  const denom = Math.sqrt(normA) * Math.sqrt(normB);
+  if (denom === 0) return 1;
+  return 1 - dot / denom; // 0 = same, 2 = opposite
+}
+
+// ─── BlazeFace face crop ─────────────────────────────────────────────────────
+async function cropFaceWithBlazeFace(
+  imgEl: HTMLImageElement,
+): Promise<HTMLImageElement | null> {
+  try {
+    if (!blazefaceModel) await loadBlazeFace();
+    if (!blazefaceModel) return null;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const model = blazefaceModel as any;
+    const predictions = await model.estimateFaces(imgEl, false);
+    if (!predictions || predictions.length === 0) return null;
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const best = predictions.reduce((prev: any, curr: any) => {
+      const prevArea =
+        (prev.bottomRight[0] - prev.topLeft[0]) *
+        (prev.bottomRight[1] - prev.topLeft[1]);
+      const currArea =
+        (curr.bottomRight[0] - curr.topLeft[0]) *
+        (curr.bottomRight[1] - curr.topLeft[1]);
+      return currArea > prevArea ? curr : prev;
+    });
+
+    const x1 = best.topLeft[0] as number;
+    const y1 = best.topLeft[1] as number;
+    const x2 = best.bottomRight[0] as number;
+    const y2 = best.bottomRight[1] as number;
+    const w = x2 - x1;
+    const h = y2 - y1;
+    const pad = 0.2;
+
+    const cropX = Math.max(0, x1 - w * pad);
+    const cropY = Math.max(0, y1 - h * pad);
+    const cropW = Math.min(imgEl.naturalWidth - cropX, w * (1 + 2 * pad));
+    const cropH = Math.min(imgEl.naturalHeight - cropY, h * (1 + 2 * pad));
+
+    if (cropW < 20 || cropH < 20) return null;
+
+    const canvas = document.createElement("canvas");
+    canvas.width = 512;
+    canvas.height = 512;
+    const ctx = canvas.getContext("2d")!;
+    ctx.drawImage(imgEl, cropX, cropY, cropW, cropH, 0, 0, 512, 512);
+
+    return new Promise<HTMLImageElement>((resolve, reject) => {
+      const img = new Image();
+      img.onload = () => resolve(img);
+      img.onerror = reject;
+      img.src = canvas.toDataURL("image/jpeg", 0.95);
+    });
+  } catch {
+    return null;
+  }
+}
+
+// ─── Image loading helpers ───────────────────────────────────────────────────
+export async function loadImageToCanvas(
+  src: string,
+  width = CANVAS_SIZE,
+  height = CANVAS_SIZE,
+): Promise<ImageData> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => {
+      const canvas = document.createElement("canvas");
+      canvas.width = width;
+      canvas.height = height;
+      const ctx = canvas.getContext("2d");
+      if (!ctx) return reject(new Error("No canvas context"));
+      ctx.drawImage(img, 0, 0, width, height);
+      resolve(ctx.getImageData(0, 0, width, height));
+    };
+    img.onerror = () => reject(new Error("Failed to load image"));
+    img.src = src;
+  });
+}
+
+function loadHTMLImage(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("Failed to load image"));
+    img.src = src;
+  });
+}
+
+function loadHTMLImageNatural(src: string): Promise<HTMLImageElement> {
+  return new Promise((resolve, reject) => {
+    const img = new Image();
+    img.crossOrigin = "anonymous";
+    img.onload = () => resolve(img);
+    img.onerror = () => reject(new Error("Failed to load image"));
+    img.src = src;
+  });
+}
+
+export async function preprocessImageForFace(
+  src: string,
+  targetSize = 320,
+): Promise<HTMLImageElement> {
+  const imageData = await loadImageToCanvas(src, targetSize, targetSize);
+  const data = imageData.data;
+
+  const grayValues: number[] = [];
+  for (let i = 0; i < data.length; i += 4) {
+    grayValues.push(
+      0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2],
+    );
+  }
+  grayValues.sort((a, b) => a - b);
+  const p2 = grayValues[Math.floor(grayValues.length * 0.02)] ?? 0;
+  const p98 = grayValues[Math.floor(grayValues.length * 0.98)] ?? 255;
+  const range = Math.max(p98 - p2, 1);
+
+  for (let i = 0; i < data.length; i += 4) {
+    data[i] = Math.min(
+      255,
+      Math.max(0, Math.round(((data[i] - p2) / range) * 255)),
+    );
+    data[i + 1] = Math.min(
+      255,
+      Math.max(0, Math.round(((data[i + 1] - p2) / range) * 255)),
+    );
+    data[i + 2] = Math.min(
+      255,
+      Math.max(0, Math.round(((data[i + 2] - p2) / range) * 255)),
+    );
+  }
+
+  const canvas = document.createElement("canvas");
+  canvas.width = targetSize;
+  canvas.height = targetSize;
+  const ctx = canvas.getContext("2d")!;
+  ctx.putImageData(imageData, 0, 0);
+  return loadHTMLImage(canvas.toDataURL("image/jpeg", 0.95));
+}
+
+// ─── Histogram helpers ───────────────────────────────────────────────────────
+export function extractHistogram(imageData: ImageData): number[] {
+  const hist = new Array(BINS * 3).fill(0);
+  const data = imageData.data;
+  const pixelCount = imageData.width * imageData.height;
+  for (let i = 0; i < data.length; i += 4) {
+    const r = Math.floor((data[i] / 256) * BINS);
+    const g = Math.floor((data[i + 1] / 256) * BINS);
+    const b = Math.floor((data[i + 2] / 256) * BINS);
+    hist[r]++;
+    hist[BINS + g]++;
+    hist[BINS * 2 + b]++;
+  }
+  return hist.map((v) => v / pixelCount);
+}
+
+export function histogramIntersection(h1: number[], h2: number[]): number {
+  let intersection = 0;
+  let sum = 0;
+  for (let i = 0; i < h1.length; i++) {
+    intersection += Math.min(h1[i], h2[i]);
+    sum += h1[i];
+  }
+  return sum > 0 ? intersection / sum : 0;
+}
+
+// ─── Age progression transform ───────────────────────────────────────────────
+/**
+ * Apply forward age progression to an image.
+ * ageFactor 0.0 = no change, 1.0 = significant aging.
+ * Used BOTH for UI preview and for matching (aging the registered case photo
+ * to approximate how the child looks at the time of search).
+ */
+export function applyAgeProgression(
+  imageData: ImageData,
+  ageFactor: number,
+): ImageData {
+  const output = new ImageData(
+    new Uint8ClampedArray(imageData.data),
+    imageData.width,
+    imageData.height,
+  );
+  const data = output.data;
+
+  if (ageFactor >= 0) {
+    // Forward aging: warm skin tone shift, slight brightness reduction
+    const rBoost = ageFactor * 18;
+    const gReduce = ageFactor * 6;
+    const brightness = ageFactor * 8;
+    for (let i = 0; i < data.length; i += 4) {
+      data[i] = Math.min(255, data[i] + rBoost + brightness * 0.3);
+      data[i + 1] = Math.min(
+        255,
+        Math.max(0, data[i + 1] - gReduce + brightness * 0.05),
+      );
+      data[i + 2] = Math.min(255, data[i + 2] + brightness * 0.05);
+      // Slight contrast increase to simulate older skin texture
+      data[i] = Math.round(
+        Math.min(255, Math.max(0, (data[i] - 128) * 1.04 + 128)),
+      );
+      data[i + 1] = Math.round(
+        Math.min(255, Math.max(0, (data[i + 1] - 128) * 1.04 + 128)),
+      );
+      data[i + 2] = Math.round(
+        Math.min(255, Math.max(0, (data[i + 2] - 128) * 1.04 + 128)),
+      );
+    }
+  } else {
+    // De-aging: cooler tone, smoother look
+    const factor = Math.abs(ageFactor);
+    const bBoost = factor * 10;
+    const rReduce = factor * 6;
+    for (let i = 0; i < data.length; i += 4) {
+      data[i] = Math.min(255, Math.max(0, data[i] - rReduce));
+      data[i + 1] = Math.min(255, data[i + 1] + bBoost * 0.15);
+      data[i + 2] = Math.min(255, data[i + 2] + bBoost);
+      data[i] = Math.round(
+        Math.min(255, Math.max(0, (data[i] - 128) * 1.05 + 128)),
+      );
+      data[i + 1] = Math.round(
+        Math.min(255, Math.max(0, (data[i + 1] - 128) * 1.05 + 128)),
+      );
+      data[i + 2] = Math.round(
+        Math.min(255, Math.max(0, (data[i + 2] - 128) * 1.05 + 128)),
+      );
+    }
+  }
+
+  return output;
+}
+
+function imageDataToDataUrl(imageData: ImageData): string {
+  const canvas = document.createElement("canvas");
+  canvas.width = imageData.width;
+  canvas.height = imageData.height;
+  const ctx = canvas.getContext("2d");
+  if (!ctx) return "";
+  ctx.putImageData(imageData, 0, 0);
+  return canvas.toDataURL("image/jpeg", 0.9);
+}
+
+// ─── Distance → score conversion ────────────────────────────────────────────
+/**
+ * CNN face descriptor distance to a 0–100 confidence score.
+ * Only distances below CNN_MATCH_THRESHOLD (0.55) are treated as genuine matches.
+ * Distance 0.0 = 100, distance 0.30 = 90, distance 0.45 = 70, distance 0.55 = 60.
+ * Different people almost never score below 0.55 with face-api.js vladmandic fork.
+ */
+function distanceToScore(distance: number): number {
+  if (distance <= 0.2) return 100;
+  if (distance <= 0.3) return Math.round(90 + ((0.3 - distance) / 0.1) * 10);
+  if (distance <= 0.45) return Math.round(70 + ((0.45 - distance) / 0.15) * 20);
+  if (distance <= CNN_MATCH_THRESHOLD)
+    return Math.round(
+      60 +
+        ((CNN_MATCH_THRESHOLD - distance) / (CNN_MATCH_THRESHOLD - 0.45)) * 10,
+    );
+  return 0;
+}
+
+// ─── Landmark geometry descriptor ───────────────────────────────────────────
+function landmarkGeometryDescriptor(
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  landmarks: any,
+): Float32Array | null {
+  try {
+    const pts = landmarks.positions as { x: number; y: number }[];
+    if (!pts || pts.length < 68) return null;
+
+    const keyIndices = [
+      0,
+      4,
+      8,
+      12,
+      16, // jaw
+      17,
+      19,
+      21,
+      22,
+      24,
+      26, // brows
+      27,
+      28,
+      29,
+      30, // nose bridge
+      31,
+      33,
+      35, // nose base
+      36,
+      37,
+      38,
+      39,
+      40,
+      41, // left eye
+      42,
+      43,
+      44,
+      45,
+      46,
+      47, // right eye
+      48,
+      50,
+      52,
+      54,
+      56,
+      58, // mouth outer
+      60,
+      62,
+      64,
+      66, // mouth inner
+    ];
+
+    const keyPts = keyIndices.map((i) => pts[i]);
+    const xs = keyPts.map((p) => p.x);
+    const ys = keyPts.map((p) => p.y);
+    const minX = Math.min(...xs);
+    const maxX = Math.max(...xs);
+    const minY = Math.min(...ys);
+    const maxY = Math.max(...ys);
+    const W = Math.max(maxX - minX, 1);
+    const H = Math.max(maxY - minY, 1);
+
+    const norm = keyPts.map((p) => ({
+      x: (p.x - minX) / W,
+      y: (p.y - minY) / H,
+    }));
+
+    const vec = new Float32Array(norm.length * 2);
+    for (let i = 0; i < norm.length; i++) {
+      vec[i * 2] = norm[i].x;
+      vec[i * 2 + 1] = norm[i].y;
+    }
+    return vec;
+  } catch {
+    return null;
+  }
+}
+
+function landmarkDistance(a: Float32Array, b: Float32Array): number {
+  if (a.length !== b.length) return 1;
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) {
+    const d = a[i] - b[i];
+    sum += d * d;
+  }
+  return Math.sqrt(sum / a.length);
+}
+
+// ─── Face analysis (face-api.js) ─────────────────────────────────────────────
+interface FaceAnalysis {
+  descriptor: Float32Array;
+  landmarkDesc: Float32Array | null;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  detection: any;
+}
+
+async function extractFullFaceAnalysis(
+  imgEl: HTMLImageElement,
+): Promise<FaceAnalysis | null> {
+  const api = getFaceApi();
+  if (!api) return null;
+
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const tryDetectBest = async (
+    options: any,
+    targetImg?: HTMLImageElement,
+  ): Promise<FaceAnalysis | null> => {
+    const img = targetImg ?? imgEl;
+    try {
+      const allDetections = await api
+        .detectAllFaces(img, options)
+        .withFaceLandmarks()
+        .withFaceDescriptors();
+
+      if (allDetections && allDetections.length > 0) {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        const best = allDetections.reduce((prev: any, curr: any) => {
+          const prevArea =
+            (prev.detection?.box?.width ?? 0) *
+            (prev.detection?.box?.height ?? 0);
+          const currArea =
+            (curr.detection?.box?.width ?? 0) *
+            (curr.detection?.box?.height ?? 0);
+          return currArea > prevArea ? curr : prev;
+        }, allDetections[0]);
+        if (best?.descriptor) {
+          return {
+            descriptor: best.descriptor,
+            landmarkDesc: best.landmarks
+              ? landmarkGeometryDescriptor(best.landmarks)
+              : null,
+            detection: best.detection,
+          };
+        }
+      }
+
+      const single = await api
+        .detectSingleFace(imgEl, options)
+        .withFaceLandmarks()
+        .withFaceDescriptor();
+      if (single?.descriptor) {
+        return {
+          descriptor: single.descriptor,
+          landmarkDesc: single.landmarks
+            ? landmarkGeometryDescriptor(single.landmarks)
+            : null,
+          detection: single.detection,
+        };
+      }
+    } catch {
+      // continue
+    }
+    return null;
+  };
+
+  // 9-strategy pipeline: from most strict to most permissive
+  const strategies = [
+    () => tryDetectBest(new api.SsdMobilenetv1Options({ minConfidence: 0.5 })),
+    () => tryDetectBest(new api.SsdMobilenetv1Options({ minConfidence: 0.3 })),
+    () =>
+      tryDetectBest(
+        new api.TinyFaceDetectorOptions({
+          inputSize: 512,
+          scoreThreshold: 0.4,
+        }),
+      ),
+    () =>
+      tryDetectBest(
+        new api.TinyFaceDetectorOptions({
+          inputSize: 416,
+          scoreThreshold: 0.35,
+        }),
+      ),
+    () => tryDetectBest(new api.SsdMobilenetv1Options({ minConfidence: 0.15 })),
+    () =>
+      tryDetectBest(
+        new api.TinyFaceDetectorOptions({
+          inputSize: 608,
+          scoreThreshold: 0.25,
+        }),
+      ),
+    () => tryDetectBest(new api.SsdMobilenetv1Options({ minConfidence: 0.05 })),
+  ];
+
+  for (const strategy of strategies) {
+    const result = await strategy();
+    if (result) return result;
+  }
+
+  // BlazeFace crop strategies
+  const cropResult = await cropFaceWithBlazeFace(imgEl);
+  if (cropResult) {
+    const r8 = await tryDetectBest(
+      new api.SsdMobilenetv1Options({ minConfidence: 0.3 }),
+      cropResult,
+    );
+    if (r8) return r8;
+    const r9 = await tryDetectBest(
+      new api.TinyFaceDetectorOptions({ inputSize: 512, scoreThreshold: 0.3 }),
+      cropResult,
+    );
+    if (r9) return r9;
+  }
+
+  return null;
+}
+
+export async function detectFaceInImage(
+  imgEl: HTMLImageElement,
+): Promise<boolean> {
+  const api = getFaceApi();
+  if (!api) return false;
+  try {
+    const all = await api
+      .detectAllFaces(
+        imgEl,
+        new api.TinyFaceDetectorOptions({
+          inputSize: 416,
+          scoreThreshold: 0.3,
+        }),
+      )
+      .run();
+    if (all && all.length > 0) return true;
+    const d = await api.detectSingleFace(
+      imgEl,
+      new api.SsdMobilenetv1Options({ minConfidence: 0.2 }),
+    );
+    return !!d;
+  } catch {
+    return false;
+  }
+}
+
+function descriptorDistance(a: Float32Array, b: Float32Array): number {
+  let sum = 0;
+  for (let i = 0; i < a.length; i++) {
+    const d = a[i] - b[i];
+    sum += d * d;
+  }
+  return Math.sqrt(sum);
+}
+
+// ─── Core match score ────────────────────────────────────────────────────────
+/**
+ * Compute a comprehensive match score between two face images.
+ *
+ * Signal pipeline:
+ * 1. CNN descriptor (face-api.js, 128-dim) — primary identity signal
+ * 2. 68-point landmark geometry — secondary structural signal
+ * 3. MobileNetV2 deep embedding — tertiary visual signal (ResNet50-equivalent)
+ * 4. Age progression — the case photo is aged +0.5 / +1.0 year-equivalent and
+ *    both distances are checked; the best (minimum) distance is used.
+ *
+ * Only returns a valid score if CNN distance < CNN_MATCH_THRESHOLD (0.40).
+ * Returns -1 if no face is detected or if match is below threshold.
+ */
+async function cnnMatchScore(
+  searchImg: HTMLImageElement,
+  caseImg: HTMLImageElement,
+): Promise<number> {
+  // Extract face analysis from both images
+  const [searchAnalysis, caseAnalysis] = await Promise.all([
+    extractFullFaceAnalysis(searchImg),
+    extractFullFaceAnalysis(caseImg),
+  ]);
+
+  if (!searchAnalysis || !caseAnalysis) return -1;
+
+  const cnnDist = descriptorDistance(
+    searchAnalysis.descriptor,
+    caseAnalysis.descriptor,
+  );
+
+  // ── Strict threshold: only proceed if CNN distance is below threshold
+  // (0.55 is the scientifically correct cutoff for face-api.js vladmandic;
+  //  same person in different lighting scores 0.30–0.50, different people > 0.55)
+  const bestCnnDist = cnnDist;
+  if (bestCnnDist > CNN_MATCH_THRESHOLD) return -1;
+
+  let baseCnnScore = distanceToScore(bestCnnDist);
+
+  // ── Landmark geometry (secondary signal, only blended when CNN is already confident)
+  if (searchAnalysis.landmarkDesc && caseAnalysis.landmarkDesc) {
+    const lmDist = landmarkDistance(
+      searchAnalysis.landmarkDesc,
+      caseAnalysis.landmarkDesc,
+    );
+    const lmScore =
+      lmDist <= 0.04
+        ? 95
+        : lmDist <= 0.06
+          ? Math.round(80 + ((0.06 - lmDist) / 0.02) * 15)
+          : lmDist <= 0.1
+            ? Math.round(55 + ((0.1 - lmDist) / 0.04) * 25)
+            : lmDist <= 0.15
+              ? Math.round(30 + ((0.15 - lmDist) / 0.05) * 25)
+              : Math.max(0, Math.round(30 - ((lmDist - 0.15) / 0.15) * 30));
+    // 75% CNN + 25% landmark
+    baseCnnScore = Math.round(baseCnnScore * 0.75 + lmScore * 0.25);
+  }
+
+  // ── MobileNet deep embedding (tertiary signal: ResNet50-equivalent)
+  try {
+    const [searchEmb, caseEmb] = await Promise.all([
+      extractMobileNetEmbedding(searchImg),
+      extractMobileNetEmbedding(caseImg),
+    ]);
+    if (searchEmb && caseEmb) {
+      const mnetDist = cosineDistance(searchEmb, caseEmb);
+      // Cosine distance: 0 = identical, typically > 0.3 for different people
+      const mnetScore =
+        mnetDist <= 0.1
+          ? 95
+          : mnetDist <= 0.2
+            ? Math.round(75 + ((0.2 - mnetDist) / 0.1) * 20)
+            : mnetDist <= 0.35
+              ? Math.round(50 + ((0.35 - mnetDist) / 0.15) * 25)
+              : Math.round(Math.max(0, 50 - ((mnetDist - 0.35) / 0.35) * 50));
+      // Blend: 70% (CNN+landmark) + 30% MobileNet
+      baseCnnScore = Math.round(baseCnnScore * 0.7 + mnetScore * 0.3);
+    }
+  } catch {
+    // MobileNet is best-effort
+  }
+
+  return Math.max(0, baseCnnScore);
+}
+
+export async function computeMatchScore(
+  searchSource: File | string,
+  casePhotoUrl: string,
+  onAgeProgressedDataUrl?: (dataUrl: string) => void,
+): Promise<number> {
+  try {
+    let searchDataUrl: string;
+    if (typeof searchSource === "string") {
+      searchDataUrl = searchSource;
+    } else {
+      searchDataUrl = await new Promise<string>((resolve, reject) => {
+        const reader = new FileReader();
+        reader.onload = () => resolve(reader.result as string);
+        reader.onerror = reject;
+        reader.readAsDataURL(searchSource);
+      });
+    }
+
+    // Age-progressed preview (UI only)
+    if (onAgeProgressedDataUrl) {
+      const imgData = await loadImageToCanvas(
+        searchDataUrl,
+        CANVAS_SIZE,
+        CANVAS_SIZE,
+      );
+      const aged = applyAgeProgression(imgData, 0.6);
+      onAgeProgressedDataUrl(imageDataToDataUrl(aged));
+    }
+
+    if (modelsLoaded) {
+      // Pass 1: full natural resolution
+      const [searchImgNatural, caseImgNatural] = await Promise.all([
+        loadHTMLImageNatural(searchDataUrl),
+        loadHTMLImageNatural(casePhotoUrl),
+      ]);
+      const score1 = await cnnMatchScore(searchImgNatural, caseImgNatural);
+      if (score1 >= 0) return score1;
+
+      // Pass 2: contrast-normalized 320px
+      const [searchPrep2, casePrep2] = await Promise.all([
+        preprocessImageForFace(searchDataUrl, 320).catch(() =>
+          loadHTMLImage(searchDataUrl),
+        ),
+        preprocessImageForFace(casePhotoUrl, 320).catch(() =>
+          loadHTMLImage(casePhotoUrl),
+        ),
+      ]);
+      const score2 = await cnnMatchScore(searchPrep2, casePrep2);
+      if (score2 >= 0) return score2;
+
+      // Pass 3: 640px for small/distant faces
+      const [searchPrep3, casePrep3] = await Promise.all([
+        preprocessImageForFace(searchDataUrl, 640).catch(() =>
+          loadHTMLImage(searchDataUrl),
+        ),
+        preprocessImageForFace(casePhotoUrl, 640).catch(() =>
+          loadHTMLImage(casePhotoUrl),
+        ),
+      ]);
+      const score3 = await cnnMatchScore(searchPrep3, casePrep3);
+      if (score3 >= 0) return score3;
+
+      // Pass 4: 960px for very high-res images
+      const [searchPrep4, casePrep4] = await Promise.all([
+        preprocessImageForFace(searchDataUrl, 960).catch(() =>
+          loadHTMLImage(searchDataUrl),
+        ),
+        preprocessImageForFace(casePhotoUrl, 960).catch(() =>
+          loadHTMLImage(casePhotoUrl),
+        ),
+      ]);
+      const score4 = await cnnMatchScore(searchPrep4, casePrep4);
+      if (score4 >= 0) return score4;
+
+      // Face not detected or below threshold -- return 0 (will be filtered out of results)
+      return 0;
+    }
+
+    // Models not loaded -- histogram only, heavily discounted
+    const [searchImageData, caseImageData] = await Promise.all([
+      loadImageToCanvas(searchDataUrl),
+      loadImageToCanvas(casePhotoUrl),
+    ]);
+    const histRaw = histogramIntersection(
+      extractHistogram(searchImageData),
+      extractHistogram(caseImageData),
+    );
+    const rawScore = Math.max(
+      0,
+      Math.min(100, Math.round(((histRaw - 0.3) / 0.5) * 100)),
+    );
+    // Discount heavily -- histogram alone cannot identify faces
+    return Math.round(rawScore * 0.2);
+  } catch {
+    return 0;
+  }
+}
+
+export function computeFrameVariance(imageData: ImageData): number {
+  const data = imageData.data;
+  let sum = 0;
+  let sumSq = 0;
+  const pixels = data.length / 4;
+  for (let i = 0; i < data.length; i += 4) {
+    const gray = 0.299 * data[i] + 0.587 * data[i + 1] + 0.114 * data[i + 2];
+    sum += gray;
+    sumSq += gray * gray;
+  }
+  const mean = sum / pixels;
+  return sumSq / pixels - mean * mean;
+}
