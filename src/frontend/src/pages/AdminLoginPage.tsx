@@ -5,6 +5,7 @@ import { Label } from "@/components/ui/label";
 import { useNavigate } from "@tanstack/react-router";
 import {
   AlertCircle,
+  CheckCircle,
   Eye,
   EyeOff,
   Loader2,
@@ -30,6 +31,7 @@ export default function AdminLoginPage() {
   const [showPassword, setShowPassword] = useState(false);
   const [error, setError] = useState("");
   const [claiming, setClaiming] = useState(false);
+  const [success, setSuccess] = useState(false);
 
   const isLoggingIn = loginStatus === "logging-in";
 
@@ -45,20 +47,40 @@ export default function AdminLoginPage() {
   const handleClaimAdmin = async (e: React.FormEvent) => {
     e.preventDefault();
     setError("");
+
     if (!password.trim()) {
       setError("Admin password is required");
       return;
     }
     if (!actor) {
-      setError("Backend not connected. Please retry.");
+      setError("Backend not connected. Please click Retry.");
       return;
     }
+
     setClaiming(true);
     try {
       await actor.claimAdminRole(password);
-      navigate({ to: "/admin" });
-    } catch (_err: unknown) {
-      setError("Invalid admin password. Use: admin123");
+      setSuccess(true);
+      setTimeout(() => navigate({ to: "/admin" }), 800);
+    } catch (err: unknown) {
+      const msg = String((err as { message?: string })?.message ?? err);
+      if (
+        msg.includes("Invalid password") ||
+        msg.includes("invalid password") ||
+        msg.includes("wrong password")
+      ) {
+        setError("Incorrect admin password. Please use the correct password.");
+      } else if (
+        msg.includes("IC0508") ||
+        msg.includes("is stopped") ||
+        msg.includes("temporarily unavailable")
+      ) {
+        setError(
+          "Backend is temporarily restarting. Please wait 30 seconds and try again.",
+        );
+      } else {
+        setError(msg || "Failed to claim admin role. Please try again.");
+      }
     } finally {
       setClaiming(false);
     }
@@ -84,11 +106,12 @@ export default function AdminLoginPage() {
         </div>
 
         <div className="bg-card rounded-xl shadow-card border border-border p-8 space-y-6">
-          {actorError && (
+          {/* Backend connection error */}
+          {actorError && !actorLoading && (
             <Alert variant="destructive">
               <AlertCircle className="h-4 w-4" />
               <AlertDescription className="flex items-center justify-between">
-                <span>Backend not connected.</span>
+                <span>Backend not connected. Click Retry to reconnect.</span>
                 <Button
                   variant="outline"
                   size="sm"
@@ -101,6 +124,17 @@ export default function AdminLoginPage() {
             </Alert>
           )}
 
+          {/* Success message */}
+          {success && (
+            <Alert className="border-green-200 bg-green-50 dark:border-green-800 dark:bg-green-950">
+              <CheckCircle className="h-4 w-4 text-green-500" />
+              <AlertDescription className="text-green-700 dark:text-green-300">
+                Admin access granted! Redirecting...
+              </AlertDescription>
+            </Alert>
+          )}
+
+          {/* General error */}
           {error && (
             <Alert variant="destructive" data-ocid="admin-login.error_state">
               <AlertCircle className="h-4 w-4" />
@@ -113,10 +147,11 @@ export default function AdminLoginPage() {
             <div className="space-y-4">
               <div className="p-4 bg-muted/40 rounded-lg text-sm text-muted-foreground">
                 <p className="font-medium text-foreground mb-1">
-                  Step 1: Authenticate
+                  Step 1: Authenticate with Internet Identity
                 </p>
                 <p>
-                  Sign in with your Internet Identity to verify your identity.
+                  Sign in with your Internet Identity to verify your identity
+                  before entering the admin password.
                 </p>
               </div>
               <Button
@@ -166,6 +201,7 @@ export default function AdminLoginPage() {
                       className="pr-10"
                       data-ocid="admin-login.input"
                       autoComplete="current-password"
+                      disabled={claiming || success}
                     />
                     <button
                       type="button"
@@ -183,7 +219,7 @@ export default function AdminLoginPage() {
                 <Button
                   type="submit"
                   className="w-full bg-primary text-primary-foreground hover:bg-primary/90"
-                  disabled={claiming || actorLoading || !actor}
+                  disabled={claiming || actorLoading || !actor || success}
                   data-ocid="admin-login.submit_button"
                 >
                   {claiming ? (
